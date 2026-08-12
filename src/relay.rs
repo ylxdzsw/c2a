@@ -84,7 +84,6 @@ impl Relay {
             let error_body = limited(&mut response, ERROR_LIMIT).await?;
             let response_bytes = error_body.len() as u64;
             self.record(AuditRecord {
-                schema_version: 1,
                 request_id,
                 started_at,
                 finished_at: audit::timestamp(),
@@ -114,7 +113,6 @@ impl Relay {
         if !accepts_content_type(content_type.as_ref()) {
             let response_bytes = limited(&mut response, ERROR_LIMIT).await?.len() as u64;
             self.record(AuditRecord {
-                schema_version: 1,
                 request_id,
                 started_at,
                 finished_at: audit::timestamp(),
@@ -183,7 +181,6 @@ impl Relay {
                 })
             };
             let record = AuditRecord {
-                schema_version: 1,
                 request_id,
                 started_at,
                 finished_at: audit::timestamp(),

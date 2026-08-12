@@ -17,7 +17,6 @@ const EVENT_LIMIT: usize = 256 * 1024;
 
 #[derive(Debug, Default, Serialize)]
 pub struct AuditRecord {
-    pub schema_version: u8,
     pub request_id: String,
     pub started_at: String,
     pub finished_at: String,

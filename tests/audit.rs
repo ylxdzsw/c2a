@@ -69,7 +69,6 @@ fn malformed_or_oversized_events_become_uninspected() {
 #[test]
 fn audit_serialization_omits_unavailable_and_secret_fields() {
     let record = audit::AuditRecord {
-        schema_version: 1,
         request_id: "request".into(),
         started_at: "start".into(),
         finished_at: "finish".into(),
@@ -85,6 +84,7 @@ fn audit_serialization_omits_unavailable_and_secret_fields() {
     };
     let value = serde_json::to_value(record).unwrap();
     let object = value.as_object().unwrap();
+    assert!(!object.contains_key("schema_version"));
     assert!(!object.contains_key("response_id"));
     assert!(!object.contains_key("input_tokens"));
     for forbidden in [
@@ -114,7 +114,6 @@ fn concurrent_audit_lines_do_not_interleave() {
             let audit = audit.clone();
             tasks.push(tokio::spawn(async move {
                 let record = audit::AuditRecord {
-                    schema_version: 1,
                     request_id: format!("request-{index}"),
                     started_at: "start".into(),
                     finished_at: "finish".into(),

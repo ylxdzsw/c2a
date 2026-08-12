@@ -132,7 +132,15 @@ upstream HTTP status, terminal outcome, and observable token counts. Payloads,
 tokens, account data, headers, errors, and hashes are not stored. Each record is
 serialized once and appended under an in-process mutex. Writes are not
 synchronously forced to stable storage per request; this is intentional
-best-effort audit durability.
+best-effort audit durability. Audit records have no schema-version field. Do not
+change the meaning of an existing audit field after it is introduced. When new
+information needs to be persisted, use a new field name or add a new field
+without versioning the record.
+
+The systemd journal is for c2a's own process and service diagnostics, mostly
+errors. It is not request or response logging; actual request/response
+information belongs in the metadata-only audit log and must not be added to the
+journal by default.
 
 Possible relay outcomes include `completed`, `incomplete`, `failed`,
 `upstream_error`, `premature_eof`, `client_disconnect`, `shutdown`, and
