@@ -1,0 +1,16 @@
+[Unit]
+Description=c2a Codex subscription relay
+Requires=c2a.socket
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/c2a serve
+TimeoutStopSec=45s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=default.target
