@@ -64,8 +64,7 @@ pub async fn append(audit: &Audit, record: &AuditRecord) -> io::Result<()> {
     let mut bytes = serde_json::to_vec(record).map_err(io::Error::other)?;
     bytes.push(b'\n');
     let mut file = audit.lock().await;
-    file.write_all(&bytes)?;
-    file.flush()
+    file.write_all(&bytes)
 }
 
 pub fn timestamp() -> String {

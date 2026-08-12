@@ -11,6 +11,8 @@ mod storage;
 
 use std::{ffi::OsString, process::ExitCode};
 
+use chrono::{DateTime, SecondsFormat, Utc};
+
 use error::{Error, Result};
 use paths::Paths;
 use storage::Lock;
@@ -119,13 +121,16 @@ fn status() -> Result<()> {
         claims.account_id,
         claims.email.as_deref().unwrap_or("unknown"),
         claims.plan.as_deref().unwrap_or("unknown"),
-        claims
-            .expiry
-            .map(|v| v.to_string())
-            .as_deref()
-            .unwrap_or("unknown")
+        format_expiry(claims.expiry)
     );
     Ok(())
+}
+
+fn format_expiry(expiry: Option<i64>) -> String {
+    expiry
+        .and_then(|value| DateTime::<Utc>::from_timestamp(value, 0))
+        .map(|value| value.to_rfc3339_opts(SecondsFormat::Secs, true))
+        .unwrap_or_else(|| "unknown".into())
 }
 fn logout() -> Result<()> {
     let paths = Paths::new()?;

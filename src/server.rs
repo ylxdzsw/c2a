@@ -44,16 +44,19 @@ pub async fn serve(relay: Relay, socket: Option<PathBuf>) -> Result<()> {
     } else {
         let path = socket
             .ok_or_else(|| Error::message("serve requires SOCKET without systemd activation"))?;
-        if fs::symlink_metadata(&path).is_ok() {
-            return Err(Error::message(format!(
-                "socket already exists: {}",
-                path.display()
-            )));
-        }
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let listener = UnixListener::bind(&path)?;
+        let listener = match UnixListener::bind(&path) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
+                return Err(Error::message(format!(
+                    "socket already exists: {}",
+                    path.display()
+                )));
+            }
+            Err(error) => return Err(error.into()),
+        };
         if let Err(error) =
             fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
         {
@@ -68,7 +71,8 @@ pub async fn serve(relay: Relay, socket: Option<PathBuf>) -> Result<()> {
     let stopping = Arc::new(AtomicBool::new(false));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     install_signal_tasks(stopping.clone())?;
-    while !stopping.load(Ordering::Relaxed) {
+    while !stopping.load(Ordering::Acquire) {
+        reap_finished(&mut tasks);
         match tokio::time::timeout(Duration::from_millis(250), listener.accept()).await {
             Ok(Ok((stream, _))) => {
                 let relay = relay.clone();
@@ -234,6 +238,14 @@ fn validate_body(bytes: &[u8]) -> std::result::Result<String, &'static str> {
     Ok(model.to_owned())
 }
 
+fn reap_finished(tasks: &mut JoinSet<()>) {
+    while let Some(result) = tasks.try_join_next() {
+        if let Err(error) = result {
+            eprintln!("c2a: connection task failed: {error}");
+        }
+    }
+}
+
 fn json_error(status: StatusCode, message: &str) -> Response<Body> {
     let id = random_id().unwrap_or_else(|_| "00000000000000000000000000000000".into());
     json_error_with_id(status, message, &id)
@@ -336,11 +348,11 @@ fn install_signal_tasks(stopping: Arc<AtomicBool>) -> io::Result<()> {
     let term_stopping = stopping.clone();
     tokio::spawn(async move {
         term.recv().await;
-        term_stopping.store(true, Ordering::Relaxed);
+        term_stopping.store(true, Ordering::Release);
     });
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
-        stopping.store(true, Ordering::Relaxed);
+        stopping.store(true, Ordering::Release);
     });
     Ok(())
 }

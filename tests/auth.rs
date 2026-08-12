@@ -2,7 +2,7 @@
 
 use std::{
     fs,
-    os::unix::fs::{MetadataExt, symlink},
+    os::unix::fs::{MetadataExt, PermissionsExt, symlink},
     path::PathBuf,
     process::Command,
 };
@@ -44,7 +44,12 @@ fn paths(root: PathBuf) -> Paths {
 
 #[test]
 fn unmatched_cli_shapes_exit_two() {
-    for arguments in [Vec::<&str>::new(), vec!["login", "extra"], vec!["unknown"]] {
+    for arguments in [
+        Vec::<&str>::new(),
+        vec!["login", "extra"],
+        vec!["serve", "one", "two"],
+        vec!["unknown"],
+    ] {
         let output = Command::new(env!("CARGO_BIN_EXE_c2a"))
             .args(arguments)
             .output()
@@ -100,5 +105,20 @@ fn credential_symlinks_are_rejected() {
     symlink(&target, &paths.auth).unwrap();
     assert!(storage::load(&paths).is_err());
     assert_eq!(fs::read_to_string(target).unwrap(), "secret");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn insecure_credential_permissions_are_rejected() {
+    let root = temp_dir();
+    let paths = paths(root.clone());
+    paths.ensure_dir().unwrap();
+    fs::write(
+        &paths.auth,
+        r#"{"version":1,"access_token":"access","refresh_token":"refresh"}"#,
+    )
+    .unwrap();
+    fs::set_permissions(&paths.auth, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(storage::load(&paths).is_err());
     fs::remove_dir_all(root).unwrap();
 }

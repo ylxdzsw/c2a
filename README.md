@@ -79,3 +79,6 @@ only timestamps, byte counts, request/response IDs, model, terminal outcome, and
 input/output token counts when observable from the SSE stream. Request bodies,
 response bodies, tokens, account data, headers, errors, and payload hashes are
 not retained.
+
+Audit lines are appended immediately but are not synchronously forced to stable
+storage for every request.
