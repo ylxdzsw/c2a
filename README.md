@@ -9,11 +9,11 @@ supports one c2a-owned ChatGPT login, and accepts only `POST /v1/responses` with
 
 ```bash
 cargo build --release
-install -Dm755 target/release/c2a ~/.local/bin/c2a
+install -Dm755 target/release/c2a /usr/local/bin/c2a
 ```
 
-The binary uses the current Codex device login flow and compatibility identity
-for Codex `0.146.1`. These private upstream details may change without notice.
+The binary uses the current Codex device login flow and identifies upstream as
+`c2a`. These private upstream details may change without notice.
 
 ## Login and status
 
@@ -40,24 +40,25 @@ created itself.
 ## Run with systemd
 
 ```bash
-install -Dm644 c2a.service ~/.config/systemd/user/c2a.service
-install -Dm644 c2a.socket ~/.config/systemd/user/c2a.socket
-systemctl --user daemon-reload
-systemctl --user enable --now c2a.socket
+install -Dm644 c2a.service /etc/systemd/system/c2a.service
+install -Dm644 c2a.socket /etc/systemd/system/c2a.socket
+systemctl daemon-reload
+systemctl enable --now c2a.socket
 ```
 
-The activated socket is `%t/c2a/c2a.sock`.
+The system service runs as root, stores state under `/root/.local/state/c2a`, and
+activates `/run/c2a/c2a.sock` with mode `0600`.
 
 ## Configure mu
 
 Percent-encode the absolute socket path in an `http+unix` Responses endpoint.
-For a user with UID `1000`:
+For the system service:
 
 ```jsonc
 {
   "providers": {
     "c2a": {
-      "endpoint": "http+unix://%2Frun%2Fuser%2F1000%2Fc2a%2Fc2a.sock/v1/responses",
+      "endpoint": "http+unix://%2Frun%2Fc2a%2Fc2a.sock/v1/responses",
       "models": {
         "gpt-5.6": {
           "context_window": 353000
@@ -75,10 +76,11 @@ forwarded.
 ## Audit records
 
 Each upstream request produces one JSON line in `audit.jsonl`. Records contain
-only timestamps, byte counts, request/response IDs, model, terminal outcome, and
+timestamps, byte counts, request/response IDs, model, terminal outcome, and
 input/output token counts when observable from the SSE stream. Request bodies,
 response bodies, tokens, account data, headers, errors, and payload hashes are
-not retained.
+not retained. Bounded upstream error details are returned only in the immediate
+local error response.
 
 Audit lines are appended immediately but are not synchronously forced to stable
 storage for every request.

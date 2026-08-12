@@ -5,11 +5,13 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/c2a serve
+User=root
+ExecStart=/usr/local/bin/c2a serve
 TimeoutStopSec=45s
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
+ReadWritePaths=/root/.local/state/c2a
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
 [Install]

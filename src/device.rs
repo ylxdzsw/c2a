@@ -13,8 +13,8 @@ use crate::{
 pub const AUTH_BASE: &str = "https://auth.openai.com";
 pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const UPSTREAM: &str = "https://chatgpt.com/backend-api/codex/responses";
-pub const CODEX_VERSION: &str = "0.146.1";
-pub const ORIGINATOR: &str = "codex_cli_rs";
+pub const ORIGINATOR: &str = "c2a";
+pub const USER_AGENT: &str = concat!("c2a/", env!("CARGO_PKG_VERSION"));
 
 const OAUTH_LIMIT: usize = 64 * 1024;
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
