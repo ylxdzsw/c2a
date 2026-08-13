@@ -15,6 +15,8 @@ pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const UPSTREAM: &str = "https://chatgpt.com/backend-api/codex/responses";
 pub const ORIGINATOR: &str = "c2a";
 pub const USER_AGENT: &str = concat!("c2a/", env!("CARGO_PKG_VERSION"));
+pub const SESSION_ID_HEADER: &str = "session-id";
+pub const ROUTING_HINT_HEADER: &str = "x-codex-routing-hint";
 
 const OAUTH_LIMIT: usize = 64 * 1024;
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(15 * 60);

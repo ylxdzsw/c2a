@@ -29,6 +29,13 @@ const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
 pub type Body = BoxBody<Bytes, Infallible>;
 
+#[derive(Debug)]
+pub struct RequestMetadata {
+    pub model: String,
+    pub prompt_cache_key: Option<String>,
+    pub service_tier: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct Relay {
     client: reqwest::Client,
@@ -55,7 +62,7 @@ impl Relay {
     pub async fn start(
         &self,
         body: Vec<u8>,
-        model: String,
+        metadata: RequestMetadata,
         request_id: String,
         permit: OwnedSemaphorePermit,
         mut shutdown: watch::Receiver<bool>,
@@ -63,13 +70,15 @@ impl Relay {
         let started_at = audit::timestamp();
         let request_bytes = body.len() as u64;
         let (credentials, claims) = refresh::credentials(&self.client, &self.paths, false).await?;
-        let mut response = self.send(&body, &credentials, &claims).await?;
+        let mut response = self.send(&body, &metadata, &credentials, &claims).await?;
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
             drop(response);
             let (credentials, claims) =
                 refresh::credentials(&self.client, &self.paths, true).await?;
-            response = self.send(&body, &credentials, &claims).await?;
+            response = self.send(&body, &metadata, &credentials, &claims).await?;
         }
+
+        let RequestMetadata { model, .. } = metadata;
 
         let status = response.status();
         let upstream_status = status.as_u16();
@@ -222,12 +231,15 @@ impl Relay {
     async fn send(
         &self,
         body: &[u8],
+        metadata: &RequestMetadata,
         credentials: &Credentials,
         claims: &Claims,
     ) -> Result<reqwest::Response> {
-        Ok(upstream_request(&self.client, body, credentials, claims)
-            .send()
-            .await?)
+        Ok(
+            upstream_request(&self.client, body, metadata, credentials, claims)
+                .send()
+                .await?,
+        )
     }
 
     async fn record(&self, record: AuditRecord) {
@@ -269,10 +281,11 @@ async fn next_or_shutdown(
 fn upstream_request(
     client: &reqwest::Client,
     body: &[u8],
+    metadata: &RequestMetadata,
     credentials: &Credentials,
     claims: &Claims,
 ) -> reqwest::RequestBuilder {
-    client
+    let mut request = client
         .post(device::UPSTREAM)
         .bearer_auth(&credentials.access_token)
         .header("Chatgpt-Account-Id", &claims.account_id)
@@ -280,7 +293,26 @@ fn upstream_request(
         .header(reqwest::header::ACCEPT, "text/event-stream")
         .header("originator", device::ORIGINATOR)
         .header(reqwest::header::USER_AGENT, device::USER_AGENT)
-        .body(body.to_vec())
+        .body(body.to_vec());
+    if let Some(value) = metadata
+        .prompt_cache_key
+        .as_deref()
+        .and_then(valid_header_value)
+    {
+        request = request.header(device::SESSION_ID_HEADER, value);
+    }
+    let routing_hint = match metadata.service_tier.as_deref() {
+        Some(tier) => format!("model={};tier={tier}", metadata.model),
+        None => format!("model={}", metadata.model),
+    };
+    if let Some(value) = valid_header_value(&routing_hint) {
+        request = request.header(device::ROUTING_HINT_HEADER, value);
+    }
+    request
+}
+
+fn valid_header_value(value: &str) -> Option<reqwest::header::HeaderValue> {
+    reqwest::header::HeaderValue::try_from(value).ok()
 }
 
 async fn limited(response: &mut reqwest::Response, limit: usize) -> Result<Vec<u8>> {
@@ -348,14 +380,19 @@ pub fn full(bytes: impl Into<Bytes>) -> Body {
 
 #[cfg(test)]
 mod tests {
-    use super::{accepts_content_type, upstream_error_detail, upstream_request};
+    use super::{RequestMetadata, accepts_content_type, upstream_error_detail, upstream_request};
     use crate::{claims::Claims, device, storage::Credentials};
 
     #[test]
     fn upstream_request_uses_honest_identity() {
         let request = upstream_request(
             &reqwest::Client::new(),
-            br#"{"model":"gpt-5.6-luna","stream":true}"#,
+            br#"{"model":"gpt-5.6-luna","stream":true,"prompt_cache_key":"session-1","service_tier":"priority"}"#,
+            &RequestMetadata {
+                model: "gpt-5.6-luna".into(),
+                prompt_cache_key: Some("session-1".into()),
+                service_tier: Some("priority".into()),
+            },
             &Credentials {
                 version: 1,
                 access_token: "access".into(),
@@ -374,12 +411,47 @@ mod tests {
             request.headers()[reqwest::header::USER_AGENT],
             device::USER_AGENT
         );
+        assert_eq!(request.headers()[device::SESSION_ID_HEADER], "session-1");
+        assert_eq!(
+            request.headers()[device::ROUTING_HINT_HEADER],
+            "model=gpt-5.6-luna;tier=priority"
+        );
         assert!(request.headers().get("version").is_none());
         assert!(
             request
                 .headers()
                 .get("x-openai-internal-codex-responses-lite")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn upstream_request_omits_invalid_session_header() {
+        let request = upstream_request(
+            &reqwest::Client::new(),
+            br#"{"model":"gpt-5","stream":true,"prompt_cache_key":"bad\\nkey"}"#,
+            &RequestMetadata {
+                model: "gpt-5".into(),
+                prompt_cache_key: Some("bad\nkey".into()),
+                service_tier: None,
+            },
+            &Credentials {
+                version: 1,
+                access_token: "access".into(),
+                refresh_token: "refresh".into(),
+            },
+            &Claims {
+                account_id: "account".into(),
+                ..Claims::default()
+            },
+        )
+        .build()
+        .unwrap();
+
+        assert!(request.headers().get(device::SESSION_ID_HEADER).is_none());
+        assert_eq!(
+            request.headers()[device::ROUTING_HINT_HEADER],
+            "model=gpt-5"
         );
     }
 

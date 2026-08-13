@@ -27,7 +27,7 @@ use tokio::{
 
 use crate::{
     error::{ApiError, ApiErrorBody, Error, Result},
-    relay::{self, Body, Relay},
+    relay::{self, Body, Relay, RequestMetadata},
 };
 
 const BODY_LIMIT: usize = 16 * 1024 * 1024;
@@ -188,8 +188,8 @@ async fn handle_inner(
         }
     };
     let bytes = collected.to_bytes().to_vec();
-    let model = match validate_body(&bytes) {
-        Ok(model) => model,
+    let metadata = match validate_body(&bytes) {
+        Ok(metadata) => metadata,
         Err(message) => {
             return Ok(json_error_with_id(
                 StatusCode::BAD_REQUEST,
@@ -209,7 +209,7 @@ async fn handle_inner(
         }
     };
     match relay
-        .start(bytes, model, request_id.clone(), permit, shutdown)
+        .start(bytes, metadata, request_id.clone(), permit, shutdown)
         .await
     {
         Ok(response) => Ok(response),
@@ -221,7 +221,7 @@ async fn handle_inner(
     }
 }
 
-fn validate_body(bytes: &[u8]) -> std::result::Result<String, &'static str> {
+fn validate_body(bytes: &[u8]) -> std::result::Result<RequestMetadata, &'static str> {
     let value: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|_| "request body must be valid JSON")?;
     let object = value
@@ -235,7 +235,17 @@ fn validate_body(bytes: &[u8]) -> std::result::Result<String, &'static str> {
     if object.get("stream") != Some(&serde_json::Value::Bool(true)) {
         return Err("stream must be true");
     }
-    Ok(model.to_owned())
+    Ok(RequestMetadata {
+        model: model.to_owned(),
+        prompt_cache_key: object
+            .get("prompt_cache_key")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+        service_tier: object
+            .get("service_tier")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
+    })
 }
 
 fn reap_finished(tasks: &mut JoinSet<()>) {
@@ -367,9 +377,12 @@ mod tests {
 
     #[test]
     fn validation_does_not_rewrite_request_bytes() {
-        let bytes = br#"{ "stream": true, "model": "gpt-5", "input": [1, 2] }"#.to_vec();
+        let bytes = br#"{ "stream": true, "model": "gpt-5", "prompt_cache_key": "session-1", "service_tier": "priority", "input": [1, 2] }"#.to_vec();
         let original = bytes.clone();
-        assert_eq!(validate_body(&bytes).unwrap(), "gpt-5");
+        let metadata = validate_body(&bytes).unwrap();
+        assert_eq!(metadata.model, "gpt-5");
+        assert_eq!(metadata.prompt_cache_key.as_deref(), Some("session-1"));
+        assert_eq!(metadata.service_tier.as_deref(), Some("priority"));
         assert_eq!(bytes, original);
     }
 }

@@ -77,7 +77,9 @@ For the system service:
 
 `c2a` does not translate models or request bodies. The configured model name and
 native Responses payload are forwarded unchanged. Local request headers are not
-forwarded.
+forwarded. For Codex backend compatibility, c2a derives `session-id` from the
+body's `prompt_cache_key` and derives `x-codex-routing-hint` from `model` and an
+optional `service_tier`.
 
 ## Audit records
 
