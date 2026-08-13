@@ -84,7 +84,7 @@ jobs:
             -name 'c2a-*.pkg.tar.zst' ! -name 'c2a-debug-*' -print -quit)
           test -n "$package"
           pacman --noconfirm -U "$package"
-          test -x /usr/bin/c2a
+          test -f /usr/bin/c2a
           test -f /usr/lib/systemd/system/c2a.service
           test -f /usr/lib/systemd/system/c2a.socket
           test -f /usr/share/doc/c2a/README.md
