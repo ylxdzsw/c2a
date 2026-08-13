@@ -84,10 +84,7 @@ jobs:
             -name 'c2a-*.pkg.tar.zst' ! -name 'c2a-debug-*' -print -quit)
           test -n "$package"
           pacman --noconfirm -U "$package"
-          test -f /usr/bin/c2a
-          test -f /usr/lib/systemd/system/c2a.service
-          test -f /usr/lib/systemd/system/c2a.socket
-          test -f /usr/share/doc/c2a/README.md
+          pacman -Qkk c2a
           /usr/bin/c2a --version | grep -Fx 'c2a 0.1.0'
           systemd-analyze verify \
             /usr/lib/systemd/system/c2a.service \
