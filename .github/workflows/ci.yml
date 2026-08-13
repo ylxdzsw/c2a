@@ -83,8 +83,8 @@ jobs:
           package=$(find . -maxdepth 1 \
             -name 'c2a-*.pkg.tar.zst' ! -name 'c2a-debug-*' -print -quit)
           test -n "$package"
+          bsdtar -tf "$package" | grep -Fx 'usr/share/doc/c2a/README.md'
           pacman --noconfirm -U "$package"
-          pacman -Qkk c2a
           /usr/bin/c2a --version | grep -Fx 'c2a 0.1.0'
           systemd-analyze verify \
             /usr/lib/systemd/system/c2a.service \
