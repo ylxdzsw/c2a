@@ -6,7 +6,7 @@ After=network-online.target
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/local/bin/c2a serve
+ExecStart=/usr/bin/c2a serve
 TimeoutStopSec=45s
 NoNewPrivileges=yes
 PrivateTmp=yes

@@ -1,0 +1,134 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Lint
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --all-targets --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Check package recipe
+        run: bash -n PKGBUILD
+
+  package:
+    name: Arch Linux package
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+
+    steps:
+      - name: Install package dependencies
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --needed --noconfirm git openssl pkgconf rust
+
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Build package from this revision
+        run: |
+          set -euo pipefail
+          useradd --create-home builder
+          package_root=$(mktemp -d)
+          cp PKGBUILD "$package_root/"
+          chown -R builder:builder "$GITHUB_WORKSPACE" "$package_root"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git update-ref refs/heads/ci-package HEAD
+          (
+            cd "$package_root"
+            runuser -u builder -- env \
+              C2A_SOURCE_URL="file://$GITHUB_WORKSPACE" \
+              C2A_SOURCE_BRANCH=ci-package \
+              makepkg --noconfirm --cleanbuild --clean --force
+          )
+          package=$(find "$package_root" -maxdepth 1 \
+            -name 'c2a-*.pkg.tar.zst' ! -name 'c2a-debug-*' -print -quit)
+          test -n "$package"
+          cp "$package" "$GITHUB_WORKSPACE/"
+
+      - name: Install and smoke-test package
+        run: |
+          set -euo pipefail
+          package=$(find . -maxdepth 1 \
+            -name 'c2a-*.pkg.tar.zst' ! -name 'c2a-debug-*' -print -quit)
+          test -n "$package"
+          pacman --noconfirm -U "$package"
+          test -x /usr/bin/c2a
+          test -f /usr/lib/systemd/system/c2a.service
+          test -f /usr/lib/systemd/system/c2a.socket
+          test -f /usr/share/doc/c2a/README.md
+          /usr/bin/c2a --version | grep -Fx 'c2a 0.1.0'
+          systemd-analyze verify \
+            /usr/lib/systemd/system/c2a.service \
+            /usr/lib/systemd/system/c2a.socket
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: arch-package
+          path: c2a-*.pkg.tar.zst
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish release
+    if: github.ref_type == 'tag'
+    needs: [test, package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: arch-package
+          path: dist
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          package=$(find dist -maxdepth 1 -name 'c2a-*.pkg.tar.zst' -print -quit)
+          test -n "$package"
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "$package" \
+              --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "$package" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --generate-notes \
+              --title "$GITHUB_REF_NAME"
+          fi

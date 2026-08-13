@@ -9,7 +9,7 @@ supports one c2a-owned ChatGPT login, and accepts only `POST /v1/responses` with
 
 ```bash
 cargo build --release
-install -Dm755 target/release/c2a /usr/local/bin/c2a
+install -Dm755 target/release/c2a /usr/bin/c2a
 ```
 
 The binary uses the current Codex device login flow and identifies upstream as
@@ -40,10 +40,16 @@ created itself.
 ## Run with systemd
 
 ```bash
-install -Dm644 c2a.service /etc/systemd/system/c2a.service
-install -Dm644 c2a.socket /etc/systemd/system/c2a.socket
+install -Dm644 c2a.service /usr/lib/systemd/system/c2a.service
+install -Dm644 c2a.socket /usr/lib/systemd/system/c2a.socket
 systemctl daemon-reload
 systemctl enable --now c2a.socket
+```
+
+On Arch Linux, build and install the package instead:
+
+```bash
+makepkg -si
 ```
 
 The system service runs as root, stores state under `/root/.local/state/c2a`, and
