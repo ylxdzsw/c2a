@@ -1,5 +1,5 @@
 pkgname=c2a
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc='Local Responses API relay for Codex and GitHub Copilot subscriptions'
 arch=('x86_64')

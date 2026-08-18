@@ -85,7 +85,8 @@ jobs:
           test -n "$package"
           bsdtar -tf "$package" | grep -Fx 'usr/share/doc/c2a/README.md'
           pacman --noconfirm -U "$package"
-          /usr/bin/c2a --version | grep -Fx 'c2a 0.1.0'
+          version=$(grep -Po '^version\s*=\s*"\K[^"]*' Cargo.toml)
+          /usr/bin/c2a --version | grep -Fx "c2a $version"
           systemd-analyze verify \
             /usr/lib/systemd/system/c2a@codex.service \
             /usr/lib/systemd/system/c2a@codex.socket \
