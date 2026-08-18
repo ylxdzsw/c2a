@@ -97,7 +97,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: arch-package
-          path: c2a-*.pkg.tar.zst
+          path: |
+            c2a-*.pkg.tar.zst
+            !c2a-debug-*.pkg.tar.zst
           if-no-files-found: error
           retention-days: 14
 
@@ -120,7 +122,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          package=$(find dist -maxdepth 1 -name 'c2a-*.pkg.tar.zst' -print -quit)
+          package=$(find dist -maxdepth 1 \
+            -name 'c2a-*.pkg.tar.zst' ! -name 'c2a-debug-*' -print -quit)
           test -n "$package"
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" "$package" \
