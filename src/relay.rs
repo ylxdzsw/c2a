@@ -16,11 +16,12 @@ use tokio::sync::{OwnedSemaphorePermit, watch};
 use crate::{
     audit::{self, Audit, AuditRecord},
     claims::Claims,
-    device,
+    copilot, device,
     error::{Error, Result},
     paths::Paths,
+    provider::{Provider, USER_AGENT},
     refresh,
-    storage::Credentials,
+    storage::CodexCredentials,
 };
 
 const ERROR_LIMIT: usize = 64 * 1024;
@@ -36,15 +37,27 @@ pub struct RequestMetadata {
     pub service_tier: Option<String>,
 }
 
-#[derive(Clone)]
 pub struct Relay {
     client: reqwest::Client,
+    provider: Provider,
     paths: Paths,
     audit: Audit,
+    credentials: tokio::sync::Mutex<()>,
+    copilot_endpoint: tokio::sync::Mutex<Option<CopilotEndpoint>>,
+}
+
+struct Sent {
+    response: reqwest::Response,
+    access_token: String,
+}
+
+struct CopilotEndpoint {
+    access_token: String,
+    endpoint: String,
 }
 
 impl Relay {
-    pub fn new(paths: Paths, audit: Audit) -> Result<Self> {
+    pub fn new(provider: Provider, paths: Paths, audit: Audit) -> Result<Self> {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(30))
             .http1_only()
@@ -54,8 +67,11 @@ impl Relay {
             .build()?;
         Ok(Self {
             client,
+            provider,
             paths,
             audit,
+            credentials: tokio::sync::Mutex::new(()),
+            copilot_endpoint: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -69,14 +85,15 @@ impl Relay {
     ) -> Result<Response<Body>> {
         let started_at = audit::timestamp();
         let request_bytes = body.len() as u64;
-        let (credentials, claims) = refresh::credentials(&self.client, &self.paths, false).await?;
-        let mut response = self.send(&body, &metadata, &credentials, &claims).await?;
-        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            drop(response);
-            let (credentials, claims) =
-                refresh::credentials(&self.client, &self.paths, true).await?;
-            response = self.send(&body, &metadata, &credentials, &claims).await?;
+        let mut sent = self.send(&body, &metadata, None).await?;
+        if sent.response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            let rejected_access_token = sent.access_token;
+            drop(sent.response);
+            sent = self
+                .send(&body, &metadata, Some(&rejected_access_token))
+                .await?;
         }
+        let mut response = sent.response;
 
         let RequestMetadata { model, .. } = metadata;
 
@@ -93,6 +110,7 @@ impl Relay {
             let error_body = limited(&mut response, ERROR_LIMIT).await?;
             let response_bytes = error_body.len() as u64;
             self.record(AuditRecord {
+                provider: self.provider.as_str().into(),
                 request_id,
                 started_at,
                 finished_at: audit::timestamp(),
@@ -122,6 +140,7 @@ impl Relay {
         if !accepts_content_type(content_type.as_ref()) {
             let response_bytes = limited(&mut response, ERROR_LIMIT).await?.len() as u64;
             self.record(AuditRecord {
+                provider: self.provider.as_str().into(),
                 request_id,
                 started_at,
                 finished_at: audit::timestamp(),
@@ -147,6 +166,7 @@ impl Relay {
             .cloned();
         let (mut sender, body_channel) = Channel::<Bytes, Infallible>::new(4);
         let audit = self.audit.clone();
+        let provider = self.provider;
         let upstream_request_id_task = upstream_request_id.clone();
         tokio::spawn(async move {
             let _permit = permit;
@@ -190,6 +210,7 @@ impl Relay {
                 })
             };
             let record = AuditRecord {
+                provider: provider.as_str().into(),
                 request_id,
                 started_at,
                 finished_at: audit::timestamp(),
@@ -232,14 +253,59 @@ impl Relay {
         &self,
         body: &[u8],
         metadata: &RequestMetadata,
-        credentials: &Credentials,
-        claims: &Claims,
-    ) -> Result<reqwest::Response> {
-        Ok(
-            upstream_request(&self.client, body, metadata, credentials, claims)
-                .send()
-                .await?,
-        )
+        rejected_access_token: Option<&str>,
+    ) -> Result<Sent> {
+        match self.provider {
+            Provider::Codex => {
+                let _guard = self.credentials.lock().await;
+                let (credentials, claims) =
+                    refresh::credentials(&self.client, &self.paths, rejected_access_token).await?;
+                let access_token = credentials.access_token.clone();
+                let request =
+                    codex_request(&self.client, body, metadata, &credentials, &claims).build()?;
+                drop(_guard);
+                Ok(Sent {
+                    response: self.client.execute(request).await?,
+                    access_token,
+                })
+            }
+            Provider::Copilot => {
+                let _guard = self.credentials.lock().await;
+                let credentials =
+                    copilot::credentials(&self.client, &self.paths, rejected_access_token).await?;
+                let access_token = credentials.access_token.clone();
+                drop(_guard);
+                let endpoint = self.copilot_endpoint(&credentials.access_token).await?;
+                Ok(Sent {
+                    response: copilot_request(
+                        &self.client,
+                        body,
+                        &endpoint,
+                        &credentials.access_token,
+                    )
+                    .send()
+                    .await?,
+                    access_token,
+                })
+            }
+        }
+    }
+
+    async fn copilot_endpoint(&self, access_token: &str) -> Result<String> {
+        let mut cache = self.copilot_endpoint.lock().await;
+        if let Some(value) = cache
+            .as_ref()
+            .filter(|value| value.access_token == access_token)
+        {
+            return Ok(value.endpoint.clone());
+        }
+        let discovery = copilot::discover(&self.client, access_token).await?;
+        let endpoint = discovery.endpoint;
+        *cache = Some(CopilotEndpoint {
+            access_token: access_token.to_owned(),
+            endpoint: endpoint.clone(),
+        });
+        Ok(endpoint)
     }
 
     async fn record(&self, record: AuditRecord) {
@@ -278,11 +344,11 @@ async fn next_or_shutdown(
         .unwrap_or(Next::Idle)
 }
 
-fn upstream_request(
+fn codex_request(
     client: &reqwest::Client,
     body: &[u8],
     metadata: &RequestMetadata,
-    credentials: &Credentials,
+    credentials: &CodexCredentials,
     claims: &Claims,
 ) -> reqwest::RequestBuilder {
     let mut request = client
@@ -292,7 +358,7 @@ fn upstream_request(
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .header(reqwest::header::ACCEPT, "text/event-stream")
         .header("originator", device::ORIGINATOR)
-        .header(reqwest::header::USER_AGENT, device::USER_AGENT)
+        .header(reqwest::header::USER_AGENT, USER_AGENT)
         .body(body.to_vec());
     if let Some(value) = metadata
         .prompt_cache_key
@@ -309,6 +375,22 @@ fn upstream_request(
         request = request.header(device::ROUTING_HINT_HEADER, value);
     }
     request
+}
+
+fn copilot_request(
+    client: &reqwest::Client,
+    body: &[u8],
+    endpoint: &str,
+    access_token: &str,
+) -> reqwest::RequestBuilder {
+    client
+        .post(format!("{endpoint}/responses"))
+        .bearer_auth(access_token)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(reqwest::header::ACCEPT, "text/event-stream")
+        .header(reqwest::header::USER_AGENT, USER_AGENT)
+        .header("X-GitHub-Api-Version", copilot::API_VERSION)
+        .body(body.to_vec())
 }
 
 fn valid_header_value(value: &str) -> Option<reqwest::header::HeaderValue> {
@@ -380,12 +462,15 @@ pub fn full(bytes: impl Into<Bytes>) -> Body {
 
 #[cfg(test)]
 mod tests {
-    use super::{RequestMetadata, accepts_content_type, upstream_error_detail, upstream_request};
-    use crate::{claims::Claims, device, storage::Credentials};
+    use super::{
+        RequestMetadata, accepts_content_type, codex_request, copilot_request,
+        upstream_error_detail,
+    };
+    use crate::{claims::Claims, copilot, device, provider::USER_AGENT, storage::CodexCredentials};
 
     #[test]
     fn upstream_request_uses_honest_identity() {
-        let request = upstream_request(
+        let request = codex_request(
             &reqwest::Client::new(),
             br#"{"model":"gpt-5.6-luna","stream":true,"prompt_cache_key":"session-1","service_tier":"priority"}"#,
             &RequestMetadata {
@@ -393,7 +478,7 @@ mod tests {
                 prompt_cache_key: Some("session-1".into()),
                 service_tier: Some("priority".into()),
             },
-            &Credentials {
+            &CodexCredentials {
                 version: 1,
                 access_token: "access".into(),
                 refresh_token: "refresh".into(),
@@ -407,10 +492,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(request.headers()["originator"], device::ORIGINATOR);
-        assert_eq!(
-            request.headers()[reqwest::header::USER_AGENT],
-            device::USER_AGENT
-        );
+        assert_eq!(request.headers()[reqwest::header::USER_AGENT], USER_AGENT);
         assert_eq!(request.headers()[device::SESSION_ID_HEADER], "session-1");
         assert_eq!(
             request.headers()[device::ROUTING_HINT_HEADER],
@@ -427,7 +509,7 @@ mod tests {
 
     #[test]
     fn upstream_request_omits_invalid_session_header() {
-        let request = upstream_request(
+        let request = codex_request(
             &reqwest::Client::new(),
             br#"{"model":"gpt-5","stream":true,"prompt_cache_key":"bad\\nkey"}"#,
             &RequestMetadata {
@@ -435,7 +517,7 @@ mod tests {
                 prompt_cache_key: Some("bad\nkey".into()),
                 service_tier: None,
             },
-            &Credentials {
+            &CodexCredentials {
                 version: 1,
                 access_token: "access".into(),
                 refresh_token: "refresh".into(),
@@ -453,6 +535,41 @@ mod tests {
             request.headers()[device::ROUTING_HINT_HEADER],
             "model=gpt-5"
         );
+    }
+
+    #[test]
+    fn copilot_request_uses_c2a_identity_and_versioned_api() {
+        let request = copilot_request(
+            &reqwest::Client::new(),
+            br#"{"model":"gpt-5.6-luna","stream":true}"#,
+            "https://api.individual.githubcopilot.com",
+            "access",
+        )
+        .build()
+        .unwrap();
+
+        assert_eq!(
+            request.url().as_str(),
+            "https://api.individual.githubcopilot.com/responses"
+        );
+        assert_eq!(request.headers()[reqwest::header::USER_AGENT], USER_AGENT);
+        assert_eq!(
+            request.headers()["X-GitHub-Api-Version"],
+            copilot::API_VERSION
+        );
+        for name in [
+            "OpenAI-Intent",
+            "X-Initiator",
+            "X-Interaction-Type",
+            "Copilot-Vision-Request",
+            "Editor-Version",
+            "Editor-Plugin-Version",
+            "Copilot-Integration-Id",
+            "X-Request-Id",
+            "originator",
+        ] {
+            assert!(request.headers().get(name).is_none(), "{name}");
+        }
     }
 
     #[test]

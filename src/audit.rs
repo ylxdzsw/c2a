@@ -2,6 +2,7 @@ use std::{
     fs::{File, OpenOptions},
     io::{self, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::io::AsRawFd,
     path::Path,
     sync::Arc,
 };
@@ -17,6 +18,7 @@ const EVENT_LIMIT: usize = 256 * 1024;
 
 #[derive(Debug, Default, Serialize)]
 pub struct AuditRecord {
+    pub provider: String,
     pub request_id: String,
     pub started_at: String,
     pub finished_at: String,
@@ -63,7 +65,16 @@ pub async fn append(audit: &Audit, record: &AuditRecord) -> io::Result<()> {
     let mut bytes = serde_json::to_vec(record).map_err(io::Error::other)?;
     bytes.push(b'\n');
     let mut file = audit.lock().await;
-    file.write_all(&bytes)
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let result = file.write_all(&bytes);
+    let unlock = if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) } != 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    };
+    result.and(unlock)
 }
 
 pub fn timestamp() -> String {

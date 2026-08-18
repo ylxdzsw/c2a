@@ -8,6 +8,8 @@ mod audit;
 mod error;
 #[path = "../src/paths.rs"]
 mod paths;
+#[path = "../src/provider.rs"]
+mod provider;
 
 fn temp_dir() -> PathBuf {
     let mut random = [0u8; 16];
@@ -69,6 +71,7 @@ fn malformed_or_oversized_events_become_uninspected() {
 #[test]
 fn audit_serialization_omits_unavailable_and_secret_fields() {
     let record = audit::AuditRecord {
+        provider: "codex".into(),
         request_id: "request".into(),
         started_at: "start".into(),
         finished_at: "finish".into(),
@@ -108,12 +111,22 @@ fn concurrent_audit_lines_do_not_interleave() {
         .build()
         .unwrap();
     runtime.block_on(async {
-        let audit = audit::open(&path).unwrap();
+        let first = audit::open(&path).unwrap();
+        let second = audit::open(&path).unwrap();
         let mut tasks = Vec::new();
         for index in 0..32 {
-            let audit = audit.clone();
+            let audit = if index % 2 == 0 {
+                first.clone()
+            } else {
+                second.clone()
+            };
             tasks.push(tokio::spawn(async move {
                 let record = audit::AuditRecord {
+                    provider: if index % 2 == 0 {
+                        "codex".into()
+                    } else {
+                        "copilot".into()
+                    },
                     request_id: format!("request-{index}"),
                     started_at: "start".into(),
                     finished_at: "finish".into(),

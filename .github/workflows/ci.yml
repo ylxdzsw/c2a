@@ -87,8 +87,10 @@ jobs:
           pacman --noconfirm -U "$package"
           /usr/bin/c2a --version | grep -Fx 'c2a 0.1.0'
           systemd-analyze verify \
-            /usr/lib/systemd/system/c2a.service \
-            /usr/lib/systemd/system/c2a.socket
+            /usr/lib/systemd/system/c2a@codex.service \
+            /usr/lib/systemd/system/c2a@codex.socket \
+            /usr/lib/systemd/system/c2a@copilot.service \
+            /usr/lib/systemd/system/c2a@copilot.socket
 
       - name: Upload package artifact
         uses: actions/upload-artifact@v7

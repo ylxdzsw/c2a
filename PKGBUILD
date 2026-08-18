@@ -1,7 +1,7 @@
 pkgname=c2a
 pkgver=0.1.0
 pkgrel=1
-pkgdesc='Local Responses API relay for a ChatGPT Codex subscription'
+pkgdesc='Local Responses API relay for Codex and GitHub Copilot subscriptions'
 arch=('x86_64')
 url='https://github.com/ylxdzsw/c2a'
 license=('LicenseRef-Unknown')
@@ -34,10 +34,10 @@ check() {
 
 package() {
   install -Dm755 "$srcdir/target/release/c2a" "$pkgdir/usr/bin/c2a"
-  install -Dm644 "$srcdir/$pkgname/c2a.service" \
-    "$pkgdir/usr/lib/systemd/system/c2a.service"
-  install -Dm644 "$srcdir/$pkgname/c2a.socket" \
-    "$pkgdir/usr/lib/systemd/system/c2a.socket"
+  install -Dm644 "$srcdir/$pkgname/c2a@.service" \
+    "$pkgdir/usr/lib/systemd/system/c2a@.service"
+  install -Dm644 "$srcdir/$pkgname/c2a@.socket" \
+    "$pkgdir/usr/lib/systemd/system/c2a@.socket"
   install -Dm644 "$srcdir/$pkgname/README.md" \
     "$pkgdir/usr/share/doc/$pkgname/README.md"
 }

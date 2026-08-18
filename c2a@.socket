@@ -1,8 +1,8 @@
 [Unit]
-Description=c2a Responses API socket
+Description=c2a %i Responses API socket
 
 [Socket]
-ListenStream=%t/c2a/c2a.sock
+ListenStream=%t/c2a/%i.sock
 SocketMode=0600
 DirectoryMode=0700
 RemoveOnStop=yes

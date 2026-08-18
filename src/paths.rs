@@ -6,12 +6,13 @@ use std::{
 };
 
 use crate::error::{Error, Result};
+use crate::provider::Provider;
 
 #[derive(Clone, Debug)]
 pub struct Paths {
     pub dir: PathBuf,
-    pub auth: PathBuf,
-    pub lock: PathBuf,
+    pub codex: PathBuf,
+    pub copilot: PathBuf,
     pub audit: PathBuf,
 }
 
@@ -34,11 +35,18 @@ impl Paths {
         };
         let dir = base.join("c2a");
         Ok(Self {
-            auth: dir.join("auth.json"),
-            lock: dir.join("auth.lock"),
+            codex: dir.join("codex.json"),
+            copilot: dir.join("copilot.json"),
             audit: dir.join("audit.jsonl"),
             dir,
         })
+    }
+
+    pub fn credentials(&self, provider: Provider) -> &Path {
+        match provider {
+            Provider::Codex => &self.codex,
+            Provider::Copilot => &self.copilot,
+        }
     }
 
     pub fn ensure_dir(&self) -> Result<()> {

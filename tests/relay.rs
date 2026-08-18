@@ -15,7 +15,7 @@ struct Server {
 }
 
 impl Server {
-    fn start() -> Self {
+    fn start(provider: &str) -> Self {
         let mut random = [0u8; 16];
         getrandom::fill(&mut random).unwrap();
         let root = std::env::temp_dir().join(format!(
@@ -29,7 +29,7 @@ impl Server {
         fs::create_dir(&root).unwrap();
         let socket = root.join("c2a.sock");
         let child = Command::new(env!("CARGO_BIN_EXE_c2a"))
-            .args(["serve", socket.to_str().unwrap()])
+            .args([provider, "serve", socket.to_str().unwrap()])
             .env("XDG_STATE_HOME", &root)
             .env_remove("LISTEN_PID")
             .env_remove("LISTEN_FDS")
@@ -83,7 +83,7 @@ fn status(response: &[u8]) -> u16 {
 }
 
 fn post(body: &[u8], content_type: &str) -> Vec<u8> {
-    let server = Server::start();
+    let server = Server::start("codex");
     let mut request = format!(
         "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
@@ -94,7 +94,7 @@ fn post(body: &[u8], content_type: &str) -> Vec<u8> {
 
 #[test]
 fn validates_path_method_and_content_type() {
-    let server = Server::start();
+    let server = Server::start("codex");
     let not_found =
         server.request(b"GET /other HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
     assert_eq!(status(&not_found), 404);
@@ -107,6 +107,33 @@ fn validates_path_method_and_content_type() {
             .contains("allow: post")
     );
     assert_eq!(status(&post(b"{}", "text/plain")), 415);
+}
+
+#[test]
+fn corrupt_copilot_credentials_do_not_stop_the_service() {
+    let server = Server::start("copilot");
+    let state = server.root.join("c2a");
+    fs::write(state.join("copilot.json"), "{bad").unwrap();
+    fs::set_permissions(
+        state.join("copilot.json"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .unwrap();
+
+    let valid = b"{\"model\":\"gpt-5.6-luna\",\"stream\":true}";
+    let mut request = format!(
+        "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        valid.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(valid);
+    assert_eq!(status(&server.request(&request)), 502);
+    assert_eq!(
+        status(
+            &server.request(b"GET /other HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        ),
+        404
+    );
 }
 
 #[test]

@@ -1,8 +1,10 @@
 mod audit;
 mod claims;
+mod copilot;
 mod device;
 mod error;
 mod paths;
+mod provider;
 mod refresh;
 mod relay;
 mod server;
@@ -15,9 +17,9 @@ use chrono::{DateTime, SecondsFormat, Utc};
 
 use error::{Error, Result};
 use paths::Paths;
-use storage::Lock;
+use provider::Provider;
 
-const USAGE: &str = "usage: c2a <login|status|logout|serve [SOCKET]>";
+const USAGE: &str = "usage: c2a <codex|copilot> <login|status|logout|serve [SOCKET]>";
 
 fn main() -> ExitCode {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -58,37 +60,38 @@ async fn run(args: Vec<OsString>) -> std::result::Result<(), MainError> {
             println!("{USAGE}");
             Ok(())
         }
-        [help, command]
-            if help == "help"
-                && matches!(
-                    command.to_str(),
-                    Some("login" | "status" | "logout" | "serve")
-                ) =>
-        {
+        [help, provider] if help == "help" && Provider::parse(provider).is_some() => {
             println!("{USAGE}");
             Ok(())
         }
-        [command, value]
-            if value == "--help"
-                && matches!(
-                    command.to_str(),
-                    Some("login" | "status" | "logout" | "serve")
-                ) =>
-        {
+        [provider, value] if value == "--help" && Provider::parse(provider).is_some() => {
             println!("{USAGE}");
             Ok(())
         }
-        [command] if command == "login" => login().await.map_err(Into::into),
-        [command] if command == "status" => status().map_err(Into::into),
-        [command] if command == "logout" => logout().map_err(Into::into),
-        [command] if command == "serve" => serve(None).await.map_err(Into::into),
-        [command, socket] if command == "serve" => {
-            serve(Some(server::socket_argument(socket.clone())))
-                .await
-                .map_err(Into::into)
+        [provider, command] if command == "login" => {
+            login(parse_provider(provider)?).await.map_err(Into::into)
         }
+        [provider, command] if command == "status" => {
+            status(parse_provider(provider)?).await.map_err(Into::into)
+        }
+        [provider, command] if command == "logout" => {
+            logout(parse_provider(provider)?).map_err(Into::into)
+        }
+        [provider, command] if command == "serve" => serve(parse_provider(provider)?, None)
+            .await
+            .map_err(Into::into),
+        [provider, command, socket] if command == "serve" => serve(
+            parse_provider(provider)?,
+            Some(server::socket_argument(socket.clone())),
+        )
+        .await
+        .map_err(Into::into),
         _ => Err(MainError::Usage("invalid command".into())),
     }
+}
+
+fn parse_provider(value: &std::ffi::OsStr) -> std::result::Result<Provider, MainError> {
+    Provider::parse(value).ok_or_else(|| MainError::Usage("invalid provider".into()))
 }
 
 fn client() -> Result<reqwest::Client> {
@@ -101,28 +104,53 @@ fn client() -> Result<reqwest::Client> {
         .referer(false)
         .build()?)
 }
-async fn login() -> Result<()> {
+async fn login(provider: Provider) -> Result<()> {
     let paths = Paths::new()?;
-    let _lock = Lock::acquire(&paths)?;
-    let credentials = device::login(&client()?).await?;
-    storage::store(&paths, &credentials)?;
+    match provider {
+        Provider::Codex => {
+            let credentials = device::login(&client()?).await?;
+            storage::store_codex(&paths, &credentials)?;
+        }
+        Provider::Copilot => {
+            let credentials = copilot::login(&client()?).await?;
+            storage::store_copilot(&paths, &credentials)?;
+        }
+    }
     println!("logged in");
     Ok(())
 }
-fn status() -> Result<()> {
+async fn status(provider: Provider) -> Result<()> {
     let paths = Paths::new()?;
-    let Some(credentials) = storage::load(&paths)? else {
-        println!("not logged in");
-        return Ok(());
-    };
-    let claims = claims::decode(&credentials.access_token)?;
-    println!(
-        "logged in\naccount: {}\nemail: {}\nplan: {}\nexpires: {}",
-        claims.account_id,
-        claims.email.as_deref().unwrap_or("unknown"),
-        claims.plan.as_deref().unwrap_or("unknown"),
-        format_expiry(claims.expiry)
-    );
+    match provider {
+        Provider::Codex => {
+            let Some(credentials) = storage::load_codex(&paths)? else {
+                println!("not logged in");
+                return Ok(());
+            };
+            let claims = claims::decode(&credentials.access_token)?;
+            println!(
+                "logged in\naccount: {}\nemail: {}\nplan: {}\nexpires: {}",
+                claims.account_id,
+                claims.email.as_deref().unwrap_or("unknown"),
+                claims.plan.as_deref().unwrap_or("unknown"),
+                format_expiry(claims.expiry)
+            );
+        }
+        Provider::Copilot => {
+            let Some(status) = copilot::status(&client()?, &paths).await? else {
+                println!("not logged in");
+                return Ok(());
+            };
+            println!(
+                "logged in\naccount: {}\nplan: {}\nendpoint: {}\nexpires: {}\nrefresh expires: {}",
+                status.login,
+                status.sku.as_deref().unwrap_or("unknown"),
+                status.endpoint,
+                format_expiry(status.expires_at),
+                format_expiry(status.refresh_expires_at)
+            );
+        }
+    }
     Ok(())
 }
 
@@ -132,17 +160,16 @@ fn format_expiry(expiry: Option<i64>) -> String {
         .map(|value| value.to_rfc3339_opts(SecondsFormat::Secs, true))
         .unwrap_or_else(|| "unknown".into())
 }
-fn logout() -> Result<()> {
+fn logout(provider: Provider) -> Result<()> {
     let paths = Paths::new()?;
-    let _lock = Lock::acquire(&paths)?;
-    storage::remove(&paths)?;
+    storage::clear(&paths, provider)?;
     println!("logged out");
     Ok(())
 }
-async fn serve(socket: Option<std::path::PathBuf>) -> Result<()> {
+async fn serve(provider: Provider, socket: Option<std::path::PathBuf>) -> Result<()> {
     let paths = Paths::new()?;
     paths.ensure_dir()?;
     let audit = audit::open(&paths.audit)?;
-    let relay = relay::Relay::new(paths, audit)?;
+    let relay = relay::Relay::new(provider, paths, audit)?;
     server::serve(relay, socket).await
 }

@@ -1,12 +1,12 @@
 [Unit]
-Description=c2a Codex subscription relay
-Requires=c2a.socket
+Description=c2a %i subscription relay
+Requires=c2a@%i.socket
 After=network-online.target
 
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/bin/c2a serve
+ExecStart=/usr/bin/c2a %i serve
 TimeoutStopSec=45s
 NoNewPrivileges=yes
 PrivateTmp=yes

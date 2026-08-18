@@ -7,14 +7,13 @@ use sha2::{Digest, Sha256};
 use crate::{
     claims,
     error::{Error, Result},
-    storage::Credentials,
+    storage::CodexCredentials,
 };
 
 pub const AUTH_BASE: &str = "https://auth.openai.com";
 pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const UPSTREAM: &str = "https://chatgpt.com/backend-api/codex/responses";
 pub const ORIGINATOR: &str = "c2a";
-pub const USER_AGENT: &str = concat!("c2a/", env!("CARGO_PKG_VERSION"));
 pub const SESSION_ID_HEADER: &str = "session-id";
 pub const ROUTING_HINT_HEADER: &str = "x-codex-routing-hint";
 
@@ -48,7 +47,7 @@ struct PollRequest<'a> {
     user_code: &'a str,
 }
 
-pub async fn login(client: &reqwest::Client) -> Result<Credentials> {
+pub async fn login(client: &reqwest::Client) -> Result<CodexCredentials> {
     let response = client
         .post(format!("{AUTH_BASE}/api/accounts/deviceauth/usercode"))
         .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -132,7 +131,7 @@ pub async fn login(client: &reqwest::Client) -> Result<Credentials> {
         .filter(|value| !value.is_empty())
         .ok_or_else(|| Error::message("login response did not contain a refresh token"))?;
     claims::decode(access)?;
-    Ok(Credentials {
+    Ok(CodexCredentials {
         version: 1,
         access_token: access.to_owned(),
         refresh_token: refresh.to_owned(),

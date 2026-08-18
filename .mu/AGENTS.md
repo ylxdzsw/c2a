@@ -2,9 +2,10 @@
 
 ## Purpose
 
-`c2a` is a Linux-only Rust service that exposes the OpenAI Responses API over a
-local Unix-domain socket and relays native streaming requests to the ChatGPT
-Codex subscription backend. It owns one ChatGPT login and accepts only:
+`c2a` is a Linux-only Rust service that exposes the OpenAI Responses API over
+local Unix-domain sockets and relays native streaming requests to either the
+ChatGPT Codex or GitHub Copilot subscription backend. It owns one login per
+provider and accepts only:
 
 ```text
 POST /v1/responses
@@ -18,16 +19,20 @@ TCP, provide API keys, or maintain an account pool.
 
 All application modules are intentionally flat under `src/`.
 
-- `main.rs`: direct `args_os()` CLI parser and command dispatch for `login`,
-  `status`, `logout`, and `serve`.
+- `main.rs`: direct `args_os()` CLI parser and provider-scoped command dispatch
+  for `login`, `status`, `logout`, and `serve`.
 - `paths.rs`: fixed XDG/HOME state paths and ownership, type, symlink, and mode
   checks.
 - `device.rs`: Codex device login, PKCE verification, OAuth response bounds,
   and fixed upstream compatibility constants.
+- `copilot.rs`: GitHub device login, token refresh, account and endpoint
+  discovery, and Copilot compatibility constants.
+- `provider.rs`: the closed `codex | copilot` provider set and shared c2a
+  identity.
 - `refresh.rs`: locked proactive refresh and the one forced refresh used after
   an upstream `401`.
-- `storage.rs`: `auth.lock`, atomic credential writes, reloads, and logout
-  removal.
+- `storage.rs`: provider credential-file locking, bounded in-place writes,
+  reloads, and logout clearing.
 - `claims.rs`: access-token JWT claim decoding, including the derived account ID.
 - `server.rs`: Unix listener, systemd socket activation, HTTP/1.1 handling,
   request validation, relay limits, and shutdown coordination.
@@ -41,7 +46,7 @@ All application modules are intentionally flat under `src/`.
 - `tests/audit.rs`: SSE split-boundary, malformed-event, audit serialization, and
   concurrent append tests.
 - `tests/relay.rs`: real Unix-socket request validation tests.
-- `c2a.service`, `c2a.socket`: root-owned system-level systemd units.
+- `c2a@.service`, `c2a@.socket`: root-owned provider-instance systemd units.
 - `README.md`: user-facing build, login, service, mu, and audit instructions.
 
 ## Key Design Decisions
@@ -51,27 +56,40 @@ All application modules are intentionally flat under `src/`.
 The original local request bytes are retained only for the duration of the
 relay and sent unchanged upstream. c2a validates a parsed JSON representation
 but does not serialize it back into a new request. Local headers are not
-forwarded. c2a always identifies itself with `originator: c2a` and
-`User-Agent: c2a/<package-version>`; it does not send a Codex `version` header
-or the Responses Lite header. Successful upstream responses may omit
-`Content-Type`, in which case c2a synthesizes `text/event-stream`; an explicitly
-wrong content type is rejected. c2a copies only content type, cache control,
-and a sanitized upstream request ID. Both `x-request-id` and
-`x-oai-request-id` are recognized upstream and exposed locally as
-`x-request-id`.
+forwarded. Both providers use `User-Agent: c2a/<package-version>`. Codex also
+uses `originator: c2a`; it does not send a Codex `version` header or the
+Responses Lite header. Copilot sends the current GitHub API version but no
+borrowed editor, plugin, integration, initiator, intent, vision, or request-ID
+identity headers. Successful upstream responses may omit `Content-Type`, in
+which case c2a synthesizes `text/event-stream`; an explicitly wrong content
+type is rejected. c2a copies only content type, cache control, and a sanitized
+upstream request ID. Both `x-request-id` and `x-oai-request-id` are recognized
+upstream and exposed locally as `x-request-id`.
 
 ### Fixed compatibility values
 
-Private Codex compatibility details are compiled into `device.rs`:
+Provider compatibility details are compiled into `device.rs` and `copilot.rs`:
 
 - Auth base: `https://auth.openai.com`
 - Responses upstream: `https://chatgpt.com/backend-api/codex/responses`
 - Client ID used by the current Codex device flow
 - Upstream identity: `originator: c2a` and `User-Agent: c2a/<package-version>`
+- GitHub device OAuth endpoints and the OpenCode public OAuth client ID
+- GitHub account and Copilot endpoint discovery endpoints
+- Copilot API version and `User-Agent: c2a/<package-version>`
 
 Keep these values centralized. When Codex changes its private protocol, update
-this module and add or adjust focused tests. Do not introduce a configuration
-layer for them unless the product scope changes.
+`device.rs`; when GitHub or Copilot changes its protocol, update `copilot.rs`.
+Add or adjust focused tests and do not introduce a configuration layer unless
+the product scope changes.
+
+As probed against the live Copilot backend on 2026-08-18,
+`gpt-5.6-luna` accepts a native streaming Responses request with only bearer
+authorization and JSON content type. It does not require
+`Copilot-Integration-Id`, `Editor-Version`, `Editor-Plugin-Version`,
+`X-Initiator`, `OpenAI-Intent`, or an explicit API-version header. Keep c2a's
+honest User-Agent and current API-version header, but do not add borrowed
+integration identity without fresh evidence.
 
 c2a always uses full Responses, including for models that official Codex may
 select for Responses Lite. Full Responses is intentional because c2a preserves
@@ -83,25 +101,39 @@ transformations.
 State is fixed at:
 
 ```text
-$XDG_STATE_HOME/c2a/auth.json
-$XDG_STATE_HOME/c2a/auth.lock
+$XDG_STATE_HOME/c2a/codex.json
+$XDG_STATE_HOME/c2a/copilot.json
 $XDG_STATE_HOME/c2a/audit.jsonl
 ```
 
 When `XDG_STATE_HOME` is unset, use `~/.local/state/c2a`. XDG and HOME paths
-must be absolute. The directory is mode `0700`; auth, lock, and audit files are
+must be absolute. The directory is mode `0700`; credential and audit files are
 regular files owned by the effective user with mode `0600`.
 
-Credential files contain only `version`, `access_token`, and `refresh_token`.
-Never persist account IDs, email, plans, expiry, ID tokens, OAuth response
-bodies, or refresh timestamps. The account ID is derived from the access-token
-claims each time credentials are loaded.
+Codex credentials contain only `version`, `access_token`, and `refresh_token`.
+Copilot credentials may additionally contain access- and refresh-token expiry
+timestamps. Never persist account IDs, email, plans, discovered endpoints, ID
+tokens, OAuth response bodies, or payload-derived values. The Codex account ID
+is derived from access-token claims; Copilot status queries the GitHub account
+and entitlement endpoints live.
 
-Credential writes use a random same-directory temporary file opened with
-`create_new` and `O_NOFOLLOW`, followed by `sync_all`, rename, and directory
-sync. Credential mutations acquire `auth.lock` with `flock`. Login acquires the
-lock before starting the device flow; refresh reloads after locking so another
-process's rotation can be reused.
+Each credential file is also its own cross-process `flock` target. Reads take a
+shared lock; writes and logout take an exclusive lock. Writes intentionally
+truncate, rewrite, and `sync_all` the same inode instead of using a separate
+lock file and atomic rename. An empty file means logged out. A nonempty corrupt
+file is an error but a new login may overwrite it.
+
+The device flow runs before the writer lock is acquired. Concurrent logins are
+not serialized; the last completed login wins. This is an accepted trade-off.
+Refresh reloads after locking so another process's rotation can be reused.
+Within a relay process, credential acquisition is asynchronously serialized so
+waiters do not block Tokio workers on `flock`. A `401` refresh is tied to the
+specific rejected access token; if another request already replaced it, reuse
+the replacement instead of refreshing again.
+
+There is intentionally no migration, legacy filename lookup, old CLI alias, or
+old systemd-unit compatibility in the program or package. Operational
+migration of an existing host is a one-time administrator action.
 
 ### Device login
 
@@ -127,14 +159,16 @@ chunk boundaries, LF/CRLF events, multiline `data:` fields, split UTF-8, and
 malformed JSON. An unfinished event may be at most 256 KiB. Observer failure
 does not stop forwarding, but it forces audit outcome `uninspected`.
 
-Audit records retain only request/response IDs, timestamps, model, byte counts,
-upstream HTTP status, terminal outcome, and observable token counts. Payloads,
-tokens, account data, headers, errors, and hashes are not stored. Each record is
-serialized once and appended under an in-process mutex. Writes are not
-synchronously forced to stable storage per request; this is intentional
-best-effort audit durability. Audit records have no schema-version field. Do not
-change the meaning of an existing audit field after it is introduced. When new
-information needs to be persisted, use a new field name or add a new field
+Audit records retain only provider, request/response IDs, timestamps, model,
+byte counts, upstream HTTP status, terminal outcome, and observable token
+counts. Payloads, tokens, account data, headers, errors, and hashes are not
+stored. Codex and Copilot services share one audit file. Each record is
+serialized once and appended under both an in-process mutex and a cross-process
+`flock`, so lines from the two service instances do not interleave. Writes are
+not synchronously forced to stable storage per request; this is intentional
+best-effort audit durability. Audit records have no schema-version field. Do
+not change the meaning of an existing audit field after it is introduced. When
+new information needs to be persisted, use a new field name or add a new field
 without versioning the record.
 
 The systemd journal is for c2a's own process and service diagnostics, mostly
@@ -158,9 +192,10 @@ SIGINT and SIGTERM stop acceptance, allow active connection tasks to finish for
 up to 30 seconds, broadcast stream shutdown, and then abort remaining tasks
 after a bounded drain period.
 
-The checked-in systemd units are installed system-wide, run c2a as root from
-`/usr/local/bin/c2a`, use `/root/.local/state/c2a`, and activate
-`/run/c2a/c2a.sock` with mode `0600`.
+The checked-in template units are installed system-wide, run c2a as root from
+`/usr/bin/c2a`, use `/root/.local/state/c2a`, and instantiate only
+`c2a@codex` and `c2a@copilot`. Their sockets are
+`/run/c2a/codex.sock` and `/run/c2a/copilot.sock`, both mode `0600`.
 
 ## Development Workflow
 
@@ -184,16 +219,19 @@ Useful broader checks:
 cargo build --release
 cargo tree --edges features
 cargo tree --duplicates
-systemd-analyze verify c2a.service c2a.socket
+systemd-analyze verify \
+  c2a@codex.service c2a@codex.socket \
+  c2a@copilot.service c2a@copilot.socket
 ```
 
 The integration tests start c2a subprocesses. The surrounding environment may
 have inherited `LISTEN_PID` or `LISTEN_FDS` values from another socket-activated
 service; tests must remove those variables when exercising manual serving.
 
-Do not run `c2a login` during automated tests. It is interactive, changes local
-credential state, and contacts the real OAuth service. Use temporary
-`XDG_STATE_HOME` directories and mock or pre-stream validation paths instead.
+Do not run `c2a <provider> login` during automated tests. It is interactive,
+changes local credential state, and contacts the real OAuth service. Use
+temporary `XDG_STATE_HOME` directories and mock or pre-stream validation paths
+instead.
 
 ## Change Notes
 
@@ -203,8 +241,9 @@ credential state, and contacts the real OAuth service. Use temporary
 - Do not log or print access tokens, refresh tokens, raw OAuth bodies, upstream
   payloads, or authorization headers.
 - Do not hash request or response payloads. SHA-256 is for PKCE only.
-- Any upstream compatibility change should be checked against current Codex
-  source and recorded near the constants in `device.rs`.
+- Any upstream compatibility change should be checked against the current
+  provider implementation or a minimal live probe and recorded near the
+  constants in `device.rs` or `copilot.rs`.
 - Any change to audit fields must preserve the minimal metadata-only schema and
   update serialization tests.
 - Any change to request validation or stream lifecycle should include a focused
