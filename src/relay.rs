@@ -9,7 +9,7 @@ use http_body_util::{BodyExt, Channel, Full, combinators::BoxBody};
 use hyper::{
     Response, StatusCode,
     body::Bytes,
-    header::{HeaderName, HeaderValue},
+    header::{CONTENT_TYPE, HeaderName, HeaderValue, RETRY_AFTER},
 };
 use tokio::sync::{OwnedSemaphorePermit, watch};
 
@@ -17,7 +17,7 @@ use crate::{
     audit::{self, Audit, AuditRecord},
     claims::Claims,
     copilot, device,
-    error::{Error, Result},
+    error::{ApiError, ApiErrorBody, Error, Result},
     paths::Paths,
     provider::{Provider, USER_AGENT},
     refresh,
@@ -107,18 +107,22 @@ impl Relay {
                 .and_then(|value| value.to_str().ok()),
         );
         if !status.is_success() {
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .cloned();
             let error_body = limited(&mut response, ERROR_LIMIT).await?;
             let response_bytes = error_body.len() as u64;
             self.record(AuditRecord {
                 provider: self.provider.as_str().into(),
-                request_id,
+                request_id: request_id.clone(),
                 started_at,
                 finished_at: audit::timestamp(),
                 model,
                 request_bytes,
                 response_bytes,
                 upstream_http_status: upstream_status,
-                upstream_request_id,
+                upstream_request_id: upstream_request_id.clone(),
                 response_id: None,
                 outcome: "upstream_error".into(),
                 input_tokens: None,
@@ -128,9 +132,14 @@ impl Relay {
             let detail = upstream_error_detail(&error_body)
                 .map(|detail| format!(": {detail}"))
                 .unwrap_or_default();
-            return Err(Error::message(format!(
-                "upstream returned {upstream_status}{detail}"
-            )));
+            let message = format!("upstream returned {upstream_status}{detail}");
+            return upstream_error_response(
+                upstream_status,
+                &message,
+                &request_id,
+                retry_after.as_ref(),
+                upstream_request_id.as_deref(),
+            );
         }
 
         let content_type = response
@@ -456,6 +465,38 @@ fn sanitize_request_id(value: Option<&str>) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn upstream_error_response(
+    upstream_status: u16,
+    message: &str,
+    request_id: &str,
+    retry_after: Option<&reqwest::header::HeaderValue>,
+    upstream_request_id: Option<&str>,
+) -> Result<Response<Body>> {
+    let status =
+        StatusCode::from_u16(upstream_status).map_err(|error| Error::message(error.to_string()))?;
+    let bytes = serde_json::to_vec(&ApiError {
+        error: ApiErrorBody {
+            message,
+            r#type: "c2a_error",
+            request_id,
+        },
+    })?;
+    let mut builder = Response::builder()
+        .status(status)
+        .header(CONTENT_TYPE, "application/json");
+    if let Some(value) =
+        retry_after.and_then(|value| HeaderValue::from_bytes(value.as_bytes()).ok())
+    {
+        builder = builder.header(RETRY_AFTER, value);
+    }
+    if let Some(value) = upstream_request_id {
+        builder = builder.header(HeaderName::from_static("x-request-id"), value);
+    }
+    builder
+        .body(full(bytes))
+        .map_err(|error| Error::message(error.to_string()))
+}
+
 pub fn full(bytes: impl Into<Bytes>) -> Body {
     Full::new(bytes.into()).boxed()
 }
@@ -464,7 +505,7 @@ pub fn full(bytes: impl Into<Bytes>) -> Body {
 mod tests {
     use super::{
         RequestMetadata, accepts_content_type, codex_request, copilot_request,
-        upstream_error_detail,
+        upstream_error_detail, upstream_error_response,
     };
     use crate::{claims::Claims, copilot, device, provider::USER_AGENT, storage::CodexCredentials};
 
@@ -583,6 +624,23 @@ mod tests {
             Some("requires a newer client")
         );
         assert_eq!(upstream_error_detail(br#"{"unknown":true}"#), None);
+    }
+
+    #[test]
+    fn upstream_error_preserves_status_and_retry_headers() {
+        let retry_after = reqwest::header::HeaderValue::from_static("120");
+        let response = upstream_error_response(
+            429,
+            "upstream returned 429: usage limit reached",
+            "local-request",
+            Some(&retry_after),
+            Some("upstream-request"),
+        )
+        .unwrap();
+
+        assert_eq!(response.status(), hyper::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[hyper::header::RETRY_AFTER], "120");
+        assert_eq!(response.headers()["x-request-id"], "upstream-request");
     }
 
     #[test]

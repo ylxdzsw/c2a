@@ -105,7 +105,9 @@ request/response IDs, model, terminal outcome, and input/output token counts
 when observable from the SSE stream. Existing records without a provider are
 left unchanged. Request bodies, response bodies, tokens, account data, headers,
 errors, and payload hashes are not retained. Bounded upstream error details are
-returned only in the immediate local error response.
+returned only in the immediate local error response. Upstream HTTP errors keep
+their status, `Retry-After`, and sanitized request ID; failures within c2a are
+returned as `502 Bad Gateway`.
 
 Audit lines are directly locked and appended immediately, but are not
 synchronously forced to stable storage for every request.

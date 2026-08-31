@@ -64,7 +64,9 @@ identity headers. Successful upstream responses may omit `Content-Type`, in
 which case c2a synthesizes `text/event-stream`; an explicitly wrong content
 type is rejected. c2a copies only content type, cache control, and a sanitized
 upstream request ID. Both `x-request-id` and `x-oai-request-id` are recognized
-upstream and exposed locally as `x-request-id`.
+upstream and exposed locally as `x-request-id`. Upstream HTTP errors retain
+their status and may additionally copy `Retry-After`; c2a-generated relay
+failures use `502 Bad Gateway`.
 
 ### Fixed compatibility values
 
