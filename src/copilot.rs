@@ -1,4 +1,7 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use serde::Deserialize;
 
@@ -58,6 +61,25 @@ struct DiscoveryEndpoints {
     api: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct QuotaResponse {
+    quota_reset_date: Option<String>,
+    quota_reset_date_utc: Option<String>,
+    token_based_billing: Option<bool>,
+    quota_snapshots: Option<BTreeMap<String, QuotaSnapshot>>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct QuotaSnapshot {
+    pub entitlement: Option<f64>,
+    pub quota_remaining: Option<f64>,
+    pub remaining: Option<f64>,
+    pub percent_remaining: Option<f64>,
+    #[serde(default)]
+    pub unlimited: bool,
+    pub token_based_billing: Option<bool>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Discovery {
     pub endpoint: String,
@@ -71,6 +93,13 @@ pub struct Status {
     pub sku: Option<String>,
     pub expires_at: Option<i64>,
     pub refresh_expires_at: Option<i64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Quota {
+    pub reset_at: Option<String>,
+    pub token_based_billing: bool,
+    pub snapshots: BTreeMap<String, QuotaSnapshot>,
 }
 
 pub async fn login(client: &reqwest::Client) -> Result<CopilotCredentials> {
@@ -266,6 +295,24 @@ pub async fn discover(client: &reqwest::Client, access_token: &str) -> Result<Di
     })
 }
 
+pub async fn quota(client: &reqwest::Client, access_token: &str) -> Result<Quota> {
+    let response = github_get(client, DISCOVERY_URL, access_token)
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        return Err(Error::message(format!(
+            "Copilot quota request failed with status {}",
+            response.status().as_u16()
+        )));
+    }
+    let value: QuotaResponse = device::decode(response).await?;
+    Ok(Quota {
+        reset_at: value.quota_reset_date_utc.or(value.quota_reset_date),
+        token_based_billing: value.token_based_billing.unwrap_or(false),
+        snapshots: value.quota_snapshots.unwrap_or_default(),
+    })
+}
+
 async fn user(client: &reqwest::Client, access_token: &str) -> Result<GitHubUser> {
     let response = github_get(client, USER_URL, access_token).send().await?;
     if !response.status().is_success() {
@@ -358,7 +405,39 @@ fn now() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{CopilotCredentials, TokenResponse, credentials_from_token, validate_endpoint};
+    use super::{
+        CopilotCredentials, QuotaResponse, TokenResponse, credentials_from_token, validate_endpoint,
+    };
+
+    #[test]
+    fn quota_response_preserves_fractional_ai_credits() {
+        let quota: QuotaResponse = serde_json::from_value(serde_json::json!({
+            "quota_reset_date": "2026-09-01",
+            "quota_reset_date_utc": "2026-09-01T00:00:00Z",
+            "token_based_billing": true,
+            "quota_snapshots": {
+                "premium_interactions": {
+                    "entitlement": 1500,
+                    "quota_remaining": 1254.7,
+                    "remaining": 1254,
+                    "percent_remaining": 83.6,
+                    "unlimited": false,
+                    "token_based_billing": true
+                }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(quota.token_based_billing, Some(true));
+        assert_eq!(
+            quota.quota_snapshots.unwrap()["premium_interactions"].quota_remaining,
+            Some(1254.7)
+        );
+        assert_eq!(
+            quota.quota_reset_date_utc.as_deref(),
+            Some("2026-09-01T00:00:00Z")
+        );
+    }
 
     #[test]
     fn token_response_preserves_optional_refresh_credentials() {

@@ -20,12 +20,18 @@ The binary uses each provider's device login flow and identifies upstream as
 ```bash
 c2a codex login
 c2a codex status
+c2a codex quota
 c2a codex logout
 
 c2a copilot login
 c2a copilot status
+c2a copilot quota
 c2a copilot logout
 ```
+
+`quota` fetches the provider's current remaining allowance and reset time.
+Codex reports percentage remaining for each usage window. Copilot reports AI
+credits on current plans and premium requests on legacy plans.
 
 Credentials and audit records are stored under `$XDG_STATE_HOME/c2a`, or
 `~/.local/state/c2a` when `XDG_STATE_HOME` is unset. The state directory must be

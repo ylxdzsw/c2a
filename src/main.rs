@@ -19,7 +19,7 @@ use error::{Error, Result};
 use paths::Paths;
 use provider::Provider;
 
-const USAGE: &str = "usage: c2a <codex|copilot> <login|status|logout|serve [SOCKET]>";
+const USAGE: &str = "usage: c2a <codex|copilot> <login|status|quota|logout|serve [SOCKET]>";
 
 fn main() -> ExitCode {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -73,6 +73,9 @@ async fn run(args: Vec<OsString>) -> std::result::Result<(), MainError> {
         }
         [provider, command] if command == "status" => {
             status(parse_provider(provider)?).await.map_err(Into::into)
+        }
+        [provider, command] if command == "quota" => {
+            quota(parse_provider(provider)?).await.map_err(Into::into)
         }
         [provider, command] if command == "logout" => {
             logout(parse_provider(provider)?).map_err(Into::into)
@@ -152,6 +155,131 @@ async fn status(provider: Provider) -> Result<()> {
         }
     }
     Ok(())
+}
+
+async fn quota(provider: Provider) -> Result<()> {
+    let paths = Paths::new()?;
+    let client = client()?;
+    let output = match provider {
+        Provider::Codex => {
+            let (credentials, claims) = refresh::credentials(&client, &paths, None).await?;
+            let quota =
+                device::quota(&client, &credentials.access_token, &claims.account_id).await?;
+            format_codex_quota(&quota)?
+        }
+        Provider::Copilot => {
+            let credentials = copilot::credentials(&client, &paths, None).await?;
+            let quota = copilot::quota(&client, &credentials.access_token).await?;
+            format_copilot_quota(&quota)?
+        }
+    };
+    println!("{output}");
+    Ok(())
+}
+
+fn format_codex_quota(quota: &device::Quota) -> Result<String> {
+    let mut lines = Vec::new();
+    if let Some(limit) = &quota.rate_limit {
+        append_codex_limit(&mut lines, None, limit);
+    }
+    for additional in quota.additional_rate_limits.as_deref().unwrap_or_default() {
+        if let Some(limit) = &additional.rate_limit {
+            append_codex_limit(&mut lines, Some(&additional.limit_name), limit);
+        }
+    }
+    if lines.is_empty() {
+        return Err(Error::message("Codex returned no quota data"));
+    }
+    Ok(lines.join("\n"))
+}
+
+fn append_codex_limit(lines: &mut Vec<String>, name: Option<&str>, limit: &device::RateLimit) {
+    for (fallback, window) in [
+        ("primary", limit.primary_window.as_ref()),
+        ("secondary", limit.secondary_window.as_ref()),
+    ] {
+        let Some(window) = window else { continue };
+        let label = window_label(window.limit_window_seconds, fallback);
+        let label = name
+            .filter(|value| !value.is_empty())
+            .map(|name| format!("{name} {label}"))
+            .unwrap_or(label);
+        lines.push(format!(
+            "{label}: {}% remaining",
+            format_number((100.0 - window.used_percent).clamp(0.0, 100.0))
+        ));
+        lines.push(format!("resets: {}", format_expiry(Some(window.reset_at))));
+    }
+}
+
+fn format_copilot_quota(quota: &copilot::Quota) -> Result<String> {
+    let mut lines = Vec::new();
+    for key in ["premium_interactions", "chat", "completions"] {
+        let Some(snapshot) = quota.snapshots.get(key) else {
+            continue;
+        };
+        let label = match key {
+            "premium_interactions"
+                if quota.token_based_billing || snapshot.token_based_billing.unwrap_or(false) =>
+            {
+                "AI credits"
+            }
+            "premium_interactions" => "premium requests",
+            "chat" => "chat",
+            "completions" => "completions",
+            _ => unreachable!(),
+        };
+        if snapshot.unlimited {
+            lines.push(format!("{label}: unlimited"));
+            continue;
+        }
+        let remaining = snapshot.quota_remaining.or(snapshot.remaining);
+        let value = match (remaining, snapshot.entitlement, snapshot.percent_remaining) {
+            (Some(remaining), Some(entitlement), Some(percent)) => format!(
+                "{} of {} remaining ({}%)",
+                format_number(remaining),
+                format_number(entitlement),
+                format_number(percent.clamp(0.0, 100.0))
+            ),
+            (Some(remaining), Some(entitlement), None) => format!(
+                "{} of {} remaining",
+                format_number(remaining),
+                format_number(entitlement)
+            ),
+            (_, _, Some(percent)) => {
+                format!("{}% remaining", format_number(percent.clamp(0.0, 100.0)))
+            }
+            _ => continue,
+        };
+        lines.push(format!("{label}: {value}"));
+    }
+    if lines.is_empty() {
+        return Err(Error::message("Copilot returned no quota data"));
+    }
+    if let Some(reset_at) = &quota.reset_at {
+        lines.push(format!("resets: {reset_at}"));
+    }
+    Ok(lines.join("\n"))
+}
+
+fn window_label(seconds: i64, fallback: &str) -> String {
+    match seconds {
+        18_000 => "5h".into(),
+        86_400 => "daily".into(),
+        604_800 => "weekly".into(),
+        2_592_000 => "monthly".into(),
+        value if value > 0 && value % 86_400 == 0 => format!("{}d", value / 86_400),
+        value if value > 0 && value % 3_600 == 0 => format!("{}h", value / 3_600),
+        _ => fallback.into(),
+    }
+}
+
+fn format_number(value: f64) -> String {
+    if value.fract() == 0.0 {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.1}")
+    }
 }
 
 fn format_expiry(expiry: Option<i64>) -> String {

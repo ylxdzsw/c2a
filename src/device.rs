@@ -7,18 +7,45 @@ use sha2::{Digest, Sha256};
 use crate::{
     claims,
     error::{Error, Result},
+    provider::USER_AGENT,
     storage::CodexCredentials,
 };
 
 pub const AUTH_BASE: &str = "https://auth.openai.com";
 pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const UPSTREAM: &str = "https://chatgpt.com/backend-api/codex/responses";
+pub const QUOTA_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 pub const ORIGINATOR: &str = "c2a";
 pub const SESSION_ID_HEADER: &str = "session-id";
 pub const ROUTING_HINT_HEADER: &str = "x-codex-routing-hint";
 
-const OAUTH_LIMIT: usize = 64 * 1024;
+const RESPONSE_LIMIT: usize = 64 * 1024;
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+#[derive(Debug, Deserialize)]
+pub struct Quota {
+    pub rate_limit: Option<RateLimit>,
+    pub additional_rate_limits: Option<Vec<AdditionalRateLimit>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AdditionalRateLimit {
+    pub limit_name: String,
+    pub rate_limit: Option<RateLimit>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RateLimit {
+    pub primary_window: Option<RateLimitWindow>,
+    pub secondary_window: Option<RateLimitWindow>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RateLimitWindow {
+    pub used_percent: f64,
+    pub limit_window_seconds: i64,
+    pub reset_at: i64,
+}
 
 #[derive(Debug, Deserialize)]
 struct DeviceCode {
@@ -138,6 +165,28 @@ pub async fn login(client: &reqwest::Client) -> Result<CodexCredentials> {
     })
 }
 
+pub async fn quota(
+    client: &reqwest::Client,
+    access_token: &str,
+    account_id: &str,
+) -> Result<Quota> {
+    let response = client
+        .get(QUOTA_URL)
+        .bearer_auth(access_token)
+        .header("ChatGPT-Account-Id", account_id)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .header(reqwest::header::USER_AGENT, USER_AGENT)
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        return Err(Error::message(format!(
+            "Codex quota request failed with status {}",
+            response.status().as_u16()
+        )));
+    }
+    decode(response).await
+}
+
 fn verify_pkce(code: &AuthorizationCode) -> Result<()> {
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(code.code_verifier.as_bytes()));
     if challenge != code.code_challenge {
@@ -165,10 +214,62 @@ pub(crate) async fn decode<T: serde::de::DeserializeOwned>(
 ) -> Result<T> {
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await? {
-        if bytes.len() + chunk.len() > OAUTH_LIMIT {
-            return Err(Error::message("OAuth response exceeds 64 KiB"));
+        if bytes.len() + chunk.len() > RESPONSE_LIMIT {
+            return Err(Error::message("upstream JSON response exceeds 64 KiB"));
         }
         bytes.extend_from_slice(&chunk);
     }
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Quota;
+
+    #[test]
+    fn quota_response_preserves_windows_and_additional_limits() {
+        let quota: Quota = serde_json::from_value(serde_json::json!({
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 20,
+                    "limit_window_seconds": 18000,
+                    "reset_after_seconds": 60,
+                    "reset_at": 123
+                },
+                "secondary_window": null
+            },
+            "additional_rate_limits": [{
+                "limit_name": "code review",
+                "metered_feature": "code_review",
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 30,
+                        "limit_window_seconds": 604800,
+                        "reset_after_seconds": 120,
+                        "reset_at": 456
+                    },
+                    "secondary_window": null
+                }
+            }]
+        }))
+        .unwrap();
+
+        let primary = quota.rate_limit.unwrap().primary_window.unwrap();
+        assert_eq!(primary.used_percent, 20.0);
+        assert_eq!(primary.limit_window_seconds, 18_000);
+        assert_eq!(primary.reset_at, 123);
+        let additional = &quota.additional_rate_limits.unwrap()[0];
+        assert_eq!(additional.limit_name, "code review");
+        assert_eq!(
+            additional
+                .rate_limit
+                .as_ref()
+                .unwrap()
+                .primary_window
+                .as_ref()
+                .unwrap()
+                .reset_at,
+            456
+        );
+    }
 }
