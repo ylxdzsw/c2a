@@ -13,7 +13,7 @@ mod storage;
 
 use std::{ffi::OsString, process::ExitCode};
 
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Local, NaiveDate, SecondsFormat, Utc};
 
 use error::{Error, Result};
 use paths::Paths;
@@ -208,7 +208,10 @@ fn append_codex_limit(lines: &mut Vec<String>, name: Option<&str>, limit: &devic
             "{label}: {}% remaining",
             format_number((100.0 - window.used_percent).clamp(0.0, 100.0))
         ));
-        lines.push(format!("resets: {}", format_expiry(Some(window.reset_at))));
+        lines.push(format!(
+            "resets: {}",
+            format_reset_timestamp(window.reset_at)
+        ));
     }
 }
 
@@ -257,7 +260,12 @@ fn format_copilot_quota(quota: &copilot::Quota) -> Result<String> {
         return Err(Error::message("Copilot returned no quota data"));
     }
     if let Some(reset_at) = &quota.reset_at {
-        lines.push(format!("resets: {reset_at}"));
+        lines.push(format!(
+            "resets: {}",
+            parse_reset_timestamp(reset_at)
+                .map(format_reset_datetime)
+                .unwrap_or_else(|| reset_at.clone())
+        ));
     }
     Ok(lines.join("\n"))
 }
@@ -288,6 +296,42 @@ fn format_expiry(expiry: Option<i64>) -> String {
         .map(|value| value.to_rfc3339_opts(SecondsFormat::Secs, true))
         .unwrap_or_else(|| "unknown".into())
 }
+
+fn format_reset_timestamp(timestamp: i64) -> String {
+    DateTime::<Utc>::from_timestamp(timestamp, 0)
+        .map(format_reset_datetime)
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn parse_reset_timestamp(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|value| value.with_timezone(&Utc))
+        .or_else(|| {
+            NaiveDate::parse_from_str(value, "%Y-%m-%d")
+                .ok()?
+                .and_hms_opt(0, 0, 0)
+                .map(|value| value.and_utc())
+        })
+}
+
+fn format_reset_datetime(reset_at: DateTime<Utc>) -> String {
+    let local = reset_at.with_timezone(&Local);
+    let remaining = format_remaining(reset_at, Utc::now());
+    format!(
+        "{} (in {remaining})",
+        local.to_rfc3339_opts(SecondsFormat::Secs, true)
+    )
+}
+
+fn format_remaining(reset_at: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let minutes = (reset_at - now).num_minutes().max(0);
+    let days = minutes / (24 * 60);
+    let hours = minutes / 60 % 24;
+    let minutes = minutes % 60;
+    format!("{days}d {hours}h {minutes}m")
+}
+
 fn logout(provider: Provider) -> Result<()> {
     let paths = Paths::new()?;
     storage::clear(&paths, provider)?;
@@ -300,4 +344,29 @@ async fn serve(provider: Provider, socket: Option<std::path::PathBuf>) -> Result
     let audit = audit::open(&paths.audit)?;
     let relay = relay::Relay::new(provider, paths, audit)?;
     server::serve(relay, socket).await
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{DateTime, Utc};
+
+    use super::{format_remaining, parse_reset_timestamp};
+
+    #[test]
+    fn reset_countdown_shows_days_hours_and_minutes() {
+        let now = DateTime::parse_from_rfc3339("2026-09-08T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let reset_at = DateTime::parse_from_rfc3339("2026-09-10T15:04:59Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        assert_eq!(format_remaining(reset_at, now), "2d 3h 4m");
+    }
+
+    #[test]
+    fn reset_timestamp_accepts_datetime_and_date_values() {
+        assert!(parse_reset_timestamp("2026-09-01T00:00:00Z").is_some());
+        assert!(parse_reset_timestamp("2026-09-01").is_some());
+    }
 }

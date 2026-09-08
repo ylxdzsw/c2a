@@ -6,7 +6,7 @@ rust-version = "1.89"
 
 [dependencies]
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
-chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 getrandom = "0.4"
 http-body-util = { version = "0.1", features = ["channel"] }
 hyper = { version = "1", features = ["http1", "server"] }

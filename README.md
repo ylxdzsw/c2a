@@ -29,7 +29,8 @@ c2a copilot quota
 c2a copilot logout
 ```
 
-`quota` fetches the provider's current remaining allowance and reset time.
+`quota` fetches the provider's current remaining allowance. Reset timestamps are
+shown in local time with the remaining days, hours, and minutes.
 Codex reports percentage remaining for each usage window. Copilot reports AI
 credits on current plans and premium requests on legacy plans.
 
