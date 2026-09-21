@@ -19,15 +19,19 @@ const EVENT_LIMIT: usize = 256 * 1024;
 #[derive(Debug, Default, Serialize)]
 pub struct AuditRecord {
     pub provider: String,
+    pub operation: String,
     pub request_id: String,
     pub started_at: String,
     pub finished_at: String,
     pub model: String,
     pub request_bytes: u64,
     pub response_bytes: u64,
-    pub upstream_http_status: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_http_status: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_imagegen_request_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_id: Option<String>,
     pub outcome: String,

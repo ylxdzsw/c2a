@@ -3,6 +3,7 @@ mod claims;
 mod copilot;
 mod device;
 mod error;
+mod images;
 mod paths;
 mod provider;
 mod refresh;

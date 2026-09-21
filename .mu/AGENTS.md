@@ -5,14 +5,17 @@
 `c2a` is a Linux-only Rust service that exposes the OpenAI Responses API over
 local Unix-domain sockets and relays native streaming requests to either the
 ChatGPT Codex or GitHub Copilot subscription backend. It owns one login per
-provider and accepts only:
+provider and accepts:
 
 ```text
 POST /v1/responses
+POST /v1/images/generations  (Codex only)
+POST /v1/images/edits        (Codex only)
 ```
 
-The request must be JSON, contain a nonempty `model`, and set `stream` to the
-boolean `true`. c2a does not translate models, rewrite request bodies, expose
+Responses requests must be JSON, contain a nonempty `model`, and set `stream`
+to the boolean `true`. Images use native non-streaming JSON (see below).
+c2a does not translate models, rewrite request bodies, expose
 TCP, provide API keys, or maintain an account pool.
 
 ## Repository Structure
@@ -40,6 +43,8 @@ All application modules are intentionally flat under `src/`.
   header filtering, byte-preserving stream forwarding, and final audit record
   creation.
 - `audit.rs`: JSONL audit records and the bounded observational SSE parser.
+- `images.rs`: native Images validation, bounded JSON relay, cancellation, and
+  selective metadata observation without decoding image bytes.
 - `sse.rs`: small alias used by the relay to access the observer boundary.
 - `error.rs`: application and JSON API error types.
 - `tests/auth.rs`: CLI, credential, path, and permission tests.
@@ -60,13 +65,51 @@ forwarded. Both providers use `User-Agent: c2a/<package-version>`. Codex also
 uses `originator: c2a`; it does not send a Codex `version` header or the
 Responses Lite header. Copilot sends the current GitHub API version but no
 borrowed editor, plugin, integration, initiator, intent, vision, or request-ID
-identity headers. Successful upstream responses may omit `Content-Type`, in
+identity headers. Successful Responses upstreams may omit `Content-Type`, in
 which case c2a synthesizes `text/event-stream`; an explicitly wrong content
 type is rejected. c2a copies only content type, cache control, and a sanitized
 upstream request ID. Both `x-request-id` and `x-oai-request-id` are recognized
 upstream and exposed locally as `x-request-id`. Upstream HTTP errors retain
 their status and may additionally copy `Retry-After`; c2a-generated relay
 failures use `502 Bad Gateway`.
+
+### Native Images
+
+The Codex socket additionally exposes JSON-only `/v1/images/generations` and
+`/v1/images/edits`, relayed to matching paths under `/backend-api/codex`.
+Compatibility source: openai/codex commit `5c5308fc9a9e` (2026-09-20),
+`codex-api/src/images.rs`, `codex-api/src/endpoint/images.rs`, and the
+`ext/image-generation` backend. No multipart, SSE Images, Responses-tool
+translation, filesystem image loading, URL fetching, or fallback is implemented.
+
+Require nonempty model and prompt; stream must be absent or false. Edits take
+one to five `images: [{image_url: ...}]` entries. Pass model IDs and unknown
+options unchanged; do not pin the service to the first-party default image model.
+Use existing bearer/account authentication and honest c2a identity, without
+Responses routing/session headers or borrowed Codex image-turn identity.
+
+Requests and successful responses are bounded to 64 MiB each. Two Images
+operations share the existing 16-relay budget. Acquire admission before body
+collection (60-second upload deadline). The 10-minute Images upstream deadline
+includes authentication, response-header wait, and body receipt. Buffer and
+validate successful JSON before local success headers; return original bytes.
+Missing content type is accepted only with valid image JSON; an explicitly
+wrong content type is rejected. Never decode or persist image data. Preserve
+normal output backpressure and handle disconnect/shutdown before headers too.
+Only retry the existing token-specific upstream 401, not ambiguous failures.
+
+Live smoke probes on 2026-09-20 accepted `gpt-image-2`, `gpt-image-2.5-flare`,
+and `gpt-image-2.5-sunburst` on both image endpoints, with c2a's own identity and
+no image-turn header. One-, two- (JPEG/PNG), and five-reference edits succeeded.
+The backend can override count, format, dimensions, and quality; preserve its
+bytes and do not assume public API option semantics. It does not echo the served
+model. See README for the observed option differences.
+
+New audit records include `operation`. Images may include the sanitized
+`upstream_imagegen_request_id`, distinct from `upstream_request_id`. Existing
+status values retain their meaning; omit `upstream_http_status` when no upstream
+response was received. Never treat an image generation ID as `response_id`.
+Top-level observable token usage is retained, not image content or prompts.
 
 ### Fixed compatibility values
 

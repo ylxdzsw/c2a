@@ -61,6 +61,12 @@ impl Server {
         stream.read_to_end(&mut response).unwrap();
         response
     }
+
+    fn post(&self, path: &str, body: &[u8], content_type: &str) -> Vec<u8> {
+        let mut request = format!("POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).into_bytes();
+        request.extend_from_slice(body);
+        self.request(&request)
+    }
 }
 
 impl Drop for Server {
@@ -148,4 +154,91 @@ fn validates_native_streaming_body() {
         )),
         400
     );
+}
+
+#[test]
+fn image_routes_are_codex_only_and_require_native_json() {
+    let codex = Server::start("codex");
+    let copilot = Server::start("copilot");
+    for path in ["/v1/images/generations", "/v1/images/edits"] {
+        assert_eq!(status(&copilot.post(path, b"{}", "application/json")), 404);
+        assert_eq!(
+            status(
+                &codex.request(
+                    format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                        .as_bytes()
+                )
+            ),
+            405
+        );
+        assert_eq!(status(&codex.post(path, b"{}", "multipart/form-data")), 415);
+        for body in [
+            b"{}".as_slice(),
+            br#"["m","p",false,[]]"#,
+            br#"{"model":"m","prompt":"p","stream":true}"#,
+            br#"{"model":"m","prompt":"p","stream":null}"#,
+        ] {
+            assert_eq!(status(&codex.post(path, body, "application/json")), 400);
+        }
+        assert_eq!(status(&codex.request(format!("POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 67108865\r\nConnection: close\r\n\r\n").as_bytes())), 413);
+    }
+    assert_eq!(
+        status(&codex.post(
+            "/v1/images/edits",
+            br#"{"model":"m","prompt":"p"}"#,
+            "application/json"
+        )),
+        400
+    );
+    assert_eq!(
+        status(&codex.post(
+            "/v1/images/edits",
+            br#"{"model":"m","prompt":"p","images":[["url"]]}"#,
+            "application/json"
+        )),
+        400
+    );
+    // Valid requests reach credential acquisition, but never the network in this empty state directory.
+    assert_eq!(
+        status(&codex.post(
+            "/v1/images/generations",
+            br#"{"model":"m","prompt":"p"}"#,
+            "application/json"
+        )),
+        502
+    );
+    assert_eq!(
+        status(&codex.post(
+            "/v1/images/edits",
+            br#"{"model":"m","prompt":"p","images":[{"image_url":"data:image/png;base64,AA=="}]}"#,
+            "application/json"
+        )),
+        502
+    );
+}
+
+#[test]
+fn image_admission_is_bounded_before_body_collection() {
+    let server = Server::start("codex");
+    let mut pending = Vec::new();
+    for _ in 0..2 {
+        let mut stream = UnixStream::connect(&server.socket).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream.write_all(b"POST /v1/images/generations HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 100\r\nExpect: 100-continue\r\n\r\n").unwrap();
+        let mut interim = [0u8; 25];
+        stream.read_exact(&mut interim).unwrap();
+        assert_eq!(&interim, b"HTTP/1.1 100 Continue\r\n\r\n");
+        pending.push(stream);
+    }
+    assert_eq!(
+        status(&server.post("/v1/images/generations", b"{}", "application/json")),
+        503
+    );
+    assert_eq!(
+        status(&server.post("/v1/responses", b"{}", "application/json")),
+        400
+    );
+    drop(pending);
 }

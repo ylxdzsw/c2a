@@ -72,14 +72,16 @@ fn malformed_or_oversized_events_become_uninspected() {
 fn audit_serialization_omits_unavailable_and_secret_fields() {
     let record = audit::AuditRecord {
         provider: "codex".into(),
+        operation: "responses".into(),
         request_id: "request".into(),
         started_at: "start".into(),
         finished_at: "finish".into(),
         model: "model".into(),
         request_bytes: 1,
         response_bytes: 2,
-        upstream_http_status: 200,
+        upstream_http_status: Some(200),
         upstream_request_id: None,
+        upstream_imagegen_request_id: None,
         response_id: None,
         outcome: "completed".into(),
         input_tokens: None,
@@ -90,6 +92,9 @@ fn audit_serialization_omits_unavailable_and_secret_fields() {
     assert!(!object.contains_key("schema_version"));
     assert!(!object.contains_key("response_id"));
     assert!(!object.contains_key("input_tokens"));
+    assert_eq!(object["operation"], "responses");
+    assert_eq!(object["upstream_http_status"], 200);
+    assert!(!object.contains_key("upstream_imagegen_request_id"));
     for forbidden in [
         "access_token",
         "account_id",
@@ -97,9 +102,34 @@ fn audit_serialization_omits_unavailable_and_secret_fields() {
         "error",
         "request_body",
         "response_body",
+        "prompt",
+        "images",
+        "b64_json",
+        "generation_id",
     ] {
         assert!(!object.contains_key(forbidden));
     }
+}
+
+#[test]
+fn image_audit_keeps_request_ids_distinct_and_omits_unknown_status() {
+    let mut record = audit::AuditRecord {
+        operation: "images.edits".into(),
+        upstream_request_id: Some("outer".into()),
+        upstream_imagegen_request_id: Some("image".into()),
+        ..audit::AuditRecord::default()
+    };
+    let value = serde_json::to_value(&record).unwrap();
+    assert_eq!(value["operation"], "images.edits");
+    assert_eq!(value["upstream_request_id"], "outer");
+    assert_eq!(value["upstream_imagegen_request_id"], "image");
+    assert!(value.get("upstream_http_status").is_none());
+    assert!(value.get("response_id").is_none());
+    record.upstream_http_status = Some(200);
+    assert_eq!(
+        serde_json::to_value(record).unwrap()["upstream_http_status"],
+        200
+    );
 }
 
 #[test]
@@ -122,6 +152,7 @@ fn concurrent_audit_lines_do_not_interleave() {
             };
             tasks.push(tokio::spawn(async move {
                 let record = audit::AuditRecord {
+                    operation: "responses".into(),
                     provider: if index % 2 == 0 {
                         "codex".into()
                     } else {
@@ -133,8 +164,9 @@ fn concurrent_audit_lines_do_not_interleave() {
                     model: "model".into(),
                     request_bytes: 1,
                     response_bytes: 2,
-                    upstream_http_status: 200,
+                    upstream_http_status: Some(200),
                     upstream_request_id: None,
+                    upstream_imagegen_request_id: None,
                     response_id: None,
                     outcome: "completed".into(),
                     input_tokens: None,

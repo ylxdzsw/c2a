@@ -14,6 +14,10 @@ use crate::{
 pub const AUTH_BASE: &str = "https://auth.openai.com";
 pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const UPSTREAM: &str = "https://chatgpt.com/backend-api/codex/responses";
+// Native JSON Images protocol: openai/codex 5c5308fc9a9e (2026-09-20),
+// codex-api/src/{images.rs,endpoint/images.rs}. No multipart or SSE adapter.
+pub const IMAGE_GENERATIONS: &str = "https://chatgpt.com/backend-api/codex/images/generations";
+pub const IMAGE_EDITS: &str = "https://chatgpt.com/backend-api/codex/images/edits";
 pub const QUOTA_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 pub const ORIGINATOR: &str = "c2a";
 pub const SESSION_ID_HEADER: &str = "session-id";

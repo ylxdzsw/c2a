@@ -1,6 +1,7 @@
 use std::{
     convert::Infallible,
     future::{Future, poll_fn},
+    sync::Arc,
     task::Poll,
     time::Duration,
 };
@@ -11,27 +12,54 @@ use hyper::{
     body::Bytes,
     header::{CONTENT_TYPE, HeaderName, HeaderValue, RETRY_AFTER},
 };
-use tokio::sync::{OwnedSemaphorePermit, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
 use crate::{
     audit::{self, Audit, AuditRecord},
     claims::Claims,
     copilot, device,
     error::{ApiError, ApiErrorBody, Error, Result},
+    images,
     paths::Paths,
     provider::{Provider, USER_AGENT},
     refresh,
     storage::CodexCredentials,
 };
 
-const ERROR_LIMIT: usize = 64 * 1024;
+pub(crate) const ERROR_LIMIT: usize = 64 * 1024;
 const ERROR_DETAIL_LIMIT: usize = 1024;
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
 pub type Body = BoxBody<Bytes, Infallible>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Operation {
+    Responses,
+    ImageGenerations,
+    ImageEdits,
+}
+
+impl Operation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Responses => "responses",
+            Self::ImageGenerations => "images.generations",
+            Self::ImageEdits => "images.edits",
+        }
+    }
+
+    fn upstream(self) -> &'static str {
+        match self {
+            Self::Responses => device::UPSTREAM,
+            Self::ImageGenerations => device::IMAGE_GENERATIONS,
+            Self::ImageEdits => device::IMAGE_EDITS,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct RequestMetadata {
+    pub operation: Operation,
     pub model: String,
     pub prompt_cache_key: Option<String>,
     pub service_tier: Option<String>,
@@ -44,6 +72,7 @@ pub struct Relay {
     audit: Audit,
     credentials: tokio::sync::Mutex<()>,
     copilot_endpoint: tokio::sync::Mutex<Option<CopilotEndpoint>>,
+    pub image_slots: Arc<Semaphore>,
 }
 
 struct Sent {
@@ -72,28 +101,47 @@ impl Relay {
             audit,
             credentials: tokio::sync::Mutex::new(()),
             copilot_endpoint: tokio::sync::Mutex::new(None),
+            image_slots: Arc::new(Semaphore::new(2)),
         })
     }
 
+    pub fn operation(&self, path: &str) -> Option<Operation> {
+        match (self.provider, path) {
+            (_, "/v1/responses") => Some(Operation::Responses),
+            (Provider::Codex, "/v1/images/generations") => Some(Operation::ImageGenerations),
+            (Provider::Codex, "/v1/images/edits") => Some(Operation::ImageEdits),
+            _ => None,
+        }
+    }
+
     pub async fn start(
-        &self,
-        body: Vec<u8>,
+        self: &Arc<Self>,
+        body: Bytes,
         metadata: RequestMetadata,
         request_id: String,
-        permit: OwnedSemaphorePermit,
+        permits: Vec<OwnedSemaphorePermit>,
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<Response<Body>> {
         let started_at = audit::timestamp();
         let request_bytes = body.len() as u64;
-        let mut sent = self.send(&body, &metadata, None).await?;
-        if sent.response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            let rejected_access_token = sent.access_token;
-            drop(sent.response);
-            sent = self
-                .send(&body, &metadata, Some(&rejected_access_token))
-                .await?;
+        if metadata.operation != Operation::Responses {
+            let record = AuditRecord {
+                provider: self.provider.as_str().into(),
+                operation: metadata.operation.as_str().into(),
+                request_id,
+                started_at,
+                model: metadata.model.clone(),
+                request_bytes,
+                outcome: "failed".into(),
+                ..AuditRecord::default()
+            };
+            let relay = self.clone();
+            return images::start(self.audit.clone(), record, permits, shutdown, async move {
+                relay.send_authenticated(&body, &metadata).await
+            })
+            .await;
         }
-        let mut response = sent.response;
+        let mut response = self.send_authenticated(&body, &metadata).await?;
 
         let RequestMetadata { model, .. } = metadata;
 
@@ -115,14 +163,16 @@ impl Relay {
             let response_bytes = error_body.len() as u64;
             self.record(AuditRecord {
                 provider: self.provider.as_str().into(),
+                operation: Operation::Responses.as_str().into(),
                 request_id: request_id.clone(),
                 started_at,
                 finished_at: audit::timestamp(),
                 model,
                 request_bytes,
                 response_bytes,
-                upstream_http_status: upstream_status,
+                upstream_http_status: Some(upstream_status),
                 upstream_request_id: upstream_request_id.clone(),
+                upstream_imagegen_request_id: None,
                 response_id: None,
                 outcome: "upstream_error".into(),
                 input_tokens: None,
@@ -150,14 +200,16 @@ impl Relay {
             let response_bytes = limited(&mut response, ERROR_LIMIT).await?.len() as u64;
             self.record(AuditRecord {
                 provider: self.provider.as_str().into(),
+                operation: Operation::Responses.as_str().into(),
                 request_id,
                 started_at,
                 finished_at: audit::timestamp(),
                 model,
                 request_bytes,
                 response_bytes,
-                upstream_http_status: upstream_status,
+                upstream_http_status: Some(upstream_status),
                 upstream_request_id,
+                upstream_imagegen_request_id: None,
                 response_id: None,
                 outcome: "upstream_error".into(),
                 input_tokens: None,
@@ -178,7 +230,7 @@ impl Relay {
         let provider = self.provider;
         let upstream_request_id_task = upstream_request_id.clone();
         tokio::spawn(async move {
-            let _permit = permit;
+            let _permits = permits;
             let mut observer = crate::sse::Observer::new();
             let mut response_bytes = 0u64;
             let mut outcome = None;
@@ -220,14 +272,16 @@ impl Relay {
             };
             let record = AuditRecord {
                 provider: provider.as_str().into(),
+                operation: Operation::Responses.as_str().into(),
                 request_id,
                 started_at,
                 finished_at: audit::timestamp(),
                 model,
                 request_bytes,
                 response_bytes,
-                upstream_http_status: upstream_status,
+                upstream_http_status: Some(upstream_status),
                 upstream_request_id: upstream_request_id_task,
+                upstream_imagegen_request_id: None,
                 response_id: observation.response_id.clone(),
                 outcome: final_outcome,
                 input_tokens: observation.input_tokens,
@@ -258,9 +312,25 @@ impl Relay {
             .map_err(|error| Error::message(error.to_string()))
     }
 
+    async fn send_authenticated(
+        &self,
+        body: &Bytes,
+        metadata: &RequestMetadata,
+    ) -> Result<reqwest::Response> {
+        let mut sent = self.send(body, metadata, None).await?;
+        if sent.response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            let rejected_access_token = sent.access_token;
+            drop(sent.response);
+            sent = self
+                .send(body, metadata, Some(&rejected_access_token))
+                .await?;
+        }
+        Ok(sent.response)
+    }
+
     async fn send(
         &self,
-        body: &[u8],
+        body: &Bytes,
         metadata: &RequestMetadata,
         rejected_access_token: Option<&str>,
     ) -> Result<Sent> {
@@ -271,7 +341,8 @@ impl Relay {
                     refresh::credentials(&self.client, &self.paths, rejected_access_token).await?;
                 let access_token = credentials.access_token.clone();
                 let request =
-                    codex_request(&self.client, body, metadata, &credentials, &claims).build()?;
+                    codex_request(&self.client, body.clone(), metadata, &credentials, &claims)
+                        .build()?;
                 drop(_guard);
                 Ok(Sent {
                     response: self.client.execute(request).await?,
@@ -355,20 +426,30 @@ async fn next_or_shutdown(
 
 fn codex_request(
     client: &reqwest::Client,
-    body: &[u8],
+    body: Bytes,
     metadata: &RequestMetadata,
     credentials: &CodexCredentials,
     claims: &Claims,
 ) -> reqwest::RequestBuilder {
     let mut request = client
-        .post(device::UPSTREAM)
+        .post(metadata.operation.upstream())
         .bearer_auth(&credentials.access_token)
         .header("Chatgpt-Account-Id", &claims.account_id)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .header(reqwest::header::ACCEPT, "text/event-stream")
+        .header(
+            reqwest::header::ACCEPT,
+            if metadata.operation == Operation::Responses {
+                "text/event-stream"
+            } else {
+                "application/json"
+            },
+        )
         .header("originator", device::ORIGINATOR)
         .header(reqwest::header::USER_AGENT, USER_AGENT)
-        .body(body.to_vec());
+        .body(body);
+    if metadata.operation != Operation::Responses {
+        return request;
+    }
     if let Some(value) = metadata
         .prompt_cache_key
         .as_deref()
@@ -406,7 +487,7 @@ fn valid_header_value(value: &str) -> Option<reqwest::header::HeaderValue> {
     reqwest::header::HeaderValue::try_from(value).ok()
 }
 
-async fn limited(response: &mut reqwest::Response, limit: usize) -> Result<Vec<u8>> {
+pub(crate) async fn limited(response: &mut reqwest::Response, limit: usize) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     while bytes.len() < limit {
         let Some(chunk) = response.chunk().await? else {
@@ -417,7 +498,7 @@ async fn limited(response: &mut reqwest::Response, limit: usize) -> Result<Vec<u
     Ok(bytes)
 }
 
-fn upstream_error_detail(bytes: &[u8]) -> Option<String> {
+pub(crate) fn upstream_error_detail(bytes: &[u8]) -> Option<String> {
     let json = serde_json::from_slice::<serde_json::Value>(bytes).ok();
     let detail = json
         .as_ref()
@@ -455,7 +536,7 @@ fn accepts_content_type(content_type: Option<&reqwest::header::HeaderValue>) -> 
         || content_type.is_none()
 }
 
-fn sanitize_request_id(value: Option<&str>) -> Option<String> {
+pub(crate) fn sanitize_request_id(value: Option<&str>) -> Option<String> {
     value
         .filter(|value| {
             !value.is_empty()
@@ -465,7 +546,7 @@ fn sanitize_request_id(value: Option<&str>) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn upstream_error_response(
+pub(crate) fn upstream_error_response(
     upstream_status: u16,
     message: &str,
     request_id: &str,
@@ -504,17 +585,66 @@ pub fn full(bytes: impl Into<Bytes>) -> Body {
 #[cfg(test)]
 mod tests {
     use super::{
-        RequestMetadata, accepts_content_type, codex_request, copilot_request,
+        Operation, RequestMetadata, accepts_content_type, codex_request, copilot_request,
         upstream_error_detail, upstream_error_response,
     };
     use crate::{claims::Claims, copilot, device, provider::USER_AGENT, storage::CodexCredentials};
 
     #[test]
+    fn image_requests_use_native_paths_and_preserve_bytes() {
+        for operation in [Operation::ImageGenerations, Operation::ImageEdits] {
+            let bytes = hyper::body::Bytes::from_static(
+                br#"{ "model":"gpt-image-2.5-flare", "prompt":"test", "quality":"xhigh" }"#,
+            );
+            let request = codex_request(
+                &reqwest::Client::new(),
+                bytes.clone(),
+                &RequestMetadata {
+                    operation,
+                    model: "gpt-image-2.5-flare".into(),
+                    prompt_cache_key: Some("unused".into()),
+                    service_tier: Some("unused".into()),
+                },
+                &CodexCredentials {
+                    version: 1,
+                    access_token: "access".into(),
+                    refresh_token: "refresh".into(),
+                },
+                &Claims {
+                    account_id: "account".into(),
+                    ..Claims::default()
+                },
+            )
+            .build()
+            .unwrap();
+            assert_eq!(request.url().as_str(), operation.upstream());
+            assert_eq!(request.body().unwrap().as_bytes().unwrap(), bytes);
+            assert_eq!(
+                request.headers()[reqwest::header::ACCEPT],
+                "application/json"
+            );
+            assert_eq!(request.headers()["authorization"], "Bearer access");
+            assert_eq!(request.headers()["chatgpt-account-id"], "account");
+            assert_eq!(request.headers()["originator"], "c2a");
+            assert_eq!(request.headers()["user-agent"], USER_AGENT);
+            for name in [
+                device::SESSION_ID_HEADER,
+                device::ROUTING_HINT_HEADER,
+                "version",
+                "x-codex-image-turn-id",
+            ] {
+                assert!(request.headers().get(name).is_none());
+            }
+        }
+    }
+
+    #[test]
     fn upstream_request_uses_honest_identity() {
         let request = codex_request(
             &reqwest::Client::new(),
-            br#"{"model":"gpt-5.6-luna","stream":true,"prompt_cache_key":"session-1","service_tier":"priority"}"#,
+            hyper::body::Bytes::from_static(br#"{"model":"gpt-5.6-luna","stream":true,"prompt_cache_key":"session-1","service_tier":"priority"}"#),
             &RequestMetadata {
+                operation: Operation::Responses,
                 model: "gpt-5.6-luna".into(),
                 prompt_cache_key: Some("session-1".into()),
                 service_tier: Some("priority".into()),
@@ -552,8 +682,11 @@ mod tests {
     fn upstream_request_omits_invalid_session_header() {
         let request = codex_request(
             &reqwest::Client::new(),
-            br#"{"model":"gpt-5","stream":true,"prompt_cache_key":"bad\\nkey"}"#,
+            hyper::body::Bytes::from_static(
+                br#"{"model":"gpt-5","stream":true,"prompt_cache_key":"bad\\nkey"}"#,
+            ),
             &RequestMetadata {
+                operation: Operation::Responses,
                 model: "gpt-5".into(),
                 prompt_cache_key: Some("bad\nkey".into()),
                 service_tier: None,

@@ -27,7 +27,8 @@ use tokio::{
 
 use crate::{
     error::{ApiError, ApiErrorBody, Error, Result},
-    relay::{self, Body, Relay, RequestMetadata},
+    images,
+    relay::{self, Body, Operation, Relay, RequestMetadata},
 };
 
 const BODY_LIMIT: usize = 16 * 1024 * 1024;
@@ -133,13 +134,13 @@ async fn handle_inner(
     shutdown: watch::Receiver<bool>,
 ) -> Result<Response<Body>> {
     let request_id = random_id()?;
-    if request.uri().path() != "/v1/responses" {
+    let Some(operation) = relay.operation(request.uri().path()) else {
         return Ok(json_error_with_id(
             StatusCode::NOT_FOUND,
             "not found",
             &request_id,
         ));
-    }
+    };
     if request.method() != Method::POST {
         let mut response = json_error_with_id(
             StatusCode::METHOD_NOT_ALLOWED,
@@ -167,19 +168,60 @@ async fn handle_inner(
             &request_id,
         ));
     }
-    let collected = match Limited::new(request.into_body(), BODY_LIMIT)
-        .collect()
-        .await
+    let mut permits = Vec::new();
+    for semaphore in std::iter::once(semaphore)
+        .chain((operation != Operation::Responses).then(|| relay.image_slots.clone()))
     {
-        Ok(value) => value,
-        Err(error) if error.downcast_ref::<LengthLimitError>().is_some() => {
+        match semaphore.try_acquire_owned() {
+            Ok(permit) => permits.push(permit),
+            Err(_) => {
+                return Ok(json_error_with_id(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "too many active relays",
+                    &request_id,
+                ));
+            }
+        }
+    }
+    let limit = if operation == Operation::Responses {
+        BODY_LIMIT
+    } else {
+        images::BODY_LIMIT
+    };
+    let too_large = || {
+        json_error_with_id(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            &format!("request body exceeds {} MiB", limit / (1024 * 1024)),
+            &request_id,
+        )
+    };
+    if request
+        .headers()
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Ok(too_large());
+    }
+    let collected = match tokio::time::timeout(
+        Duration::from_secs(60),
+        Limited::new(request.into_body(), limit).collect(),
+    )
+    .await
+    {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) if error.downcast_ref::<LengthLimitError>().is_some() => {
+            return Ok(too_large());
+        }
+        Err(_) => {
             return Ok(json_error_with_id(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "request body exceeds 16 MiB",
+                StatusCode::REQUEST_TIMEOUT,
+                "request body timed out",
                 &request_id,
             ));
         }
-        Err(_) => {
+        Ok(Err(_)) => {
             return Ok(json_error_with_id(
                 StatusCode::BAD_REQUEST,
                 "request body could not be read",
@@ -187,8 +229,13 @@ async fn handle_inner(
             ));
         }
     };
-    let bytes = collected.to_bytes().to_vec();
-    let metadata = match validate_body(&bytes) {
+    let bytes = collected.to_bytes();
+    let validation = if operation == Operation::Responses {
+        validate_body(&bytes)
+    } else {
+        images::validate(&bytes, operation)
+    };
+    let metadata = match validation {
         Ok(metadata) => metadata,
         Err(message) => {
             return Ok(json_error_with_id(
@@ -198,18 +245,8 @@ async fn handle_inner(
             ));
         }
     };
-    let permit = match semaphore.try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
-            return Ok(json_error_with_id(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "too many active relays",
-                &request_id,
-            ));
-        }
-    };
     match relay
-        .start(bytes, metadata, request_id.clone(), permit, shutdown)
+        .start(bytes, metadata, request_id.clone(), permits, shutdown)
         .await
     {
         Ok(response) => Ok(response),
@@ -236,6 +273,7 @@ fn validate_body(bytes: &[u8]) -> std::result::Result<RequestMetadata, &'static 
         return Err("stream must be true");
     }
     Ok(RequestMetadata {
+        operation: Operation::Responses,
         model: model.to_owned(),
         prompt_cache_key: object
             .get("prompt_cache_key")
