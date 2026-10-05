@@ -31,6 +31,7 @@ fn completed_event() -> Vec<u8> {
         ": comment\r\n",
         "data: {\"type\":\"response.completed\",\r\n",
         "data: \"response\":{\"id\":\"resp_test\",\"status\":\"completed\",",
+        "\"model\":\"returned-model\",",
         "\"usage\":{\"input_tokens\":10,\"output_tokens\":4}},\"note\":\"snowman ",
         "\u{2603}\"}\r\n\r\n"
     )
@@ -52,9 +53,33 @@ fn sse_parses_across_every_byte_split() {
             Some("resp_test")
         );
         assert_eq!(observer.observation.outcome.as_deref(), Some("completed"));
+        assert_eq!(
+            observer.observation.response_model.as_deref(),
+            Some("returned-model")
+        );
         assert_eq!(observer.observation.input_tokens, Some(10));
         assert_eq!(observer.observation.output_tokens, Some(4));
     }
+}
+
+#[test]
+fn sse_model_is_optional_and_retained_when_later_events_omit_it() {
+    let mut observer = audit::SseObserver::new();
+    for model in [serde_json::Value::Null, "".into(), 42.into()] {
+        let event = serde_json::json!({"type": "response.created", "response": {"model": model}});
+        observer.feed(format!("data: {event}\n\n").as_bytes());
+        assert!(observer.observation.response_model.is_none());
+    }
+    observer.feed(
+        b"data: {\"type\":\"response.created\",\"response\":{\"model\":\"returned-model\"}}\n\n",
+    );
+    observer.feed(b"data: {\"type\":\"response.completed\",\"response\":{}}\n\n");
+    observer.finish();
+    assert!(!observer.failed());
+    assert_eq!(
+        observer.observation.response_model.as_deref(),
+        Some("returned-model")
+    );
 }
 
 #[test]
@@ -77,6 +102,7 @@ fn audit_serialization_omits_unavailable_and_secret_fields() {
         started_at: "start".into(),
         finished_at: "finish".into(),
         model: "model".into(),
+        response_model: None,
         request_bytes: 1,
         response_bytes: 2,
         upstream_http_status: Some(200),
@@ -91,6 +117,7 @@ fn audit_serialization_omits_unavailable_and_secret_fields() {
     let object = value.as_object().unwrap();
     assert!(!object.contains_key("schema_version"));
     assert!(!object.contains_key("response_id"));
+    assert!(!object.contains_key("response_model"));
     assert!(!object.contains_key("input_tokens"));
     assert_eq!(object["operation"], "responses");
     assert_eq!(object["upstream_http_status"], 200);
@@ -109,6 +136,18 @@ fn audit_serialization_omits_unavailable_and_secret_fields() {
     ] {
         assert!(!object.contains_key(forbidden));
     }
+}
+
+#[test]
+fn audit_serializes_requested_and_returned_models_separately() {
+    let record = audit::AuditRecord {
+        model: "requested-model".into(),
+        response_model: Some("returned-model".into()),
+        ..audit::AuditRecord::default()
+    };
+    let value = serde_json::to_value(record).unwrap();
+    assert_eq!(value["model"], "requested-model");
+    assert_eq!(value["response_model"], "returned-model");
 }
 
 #[test]
@@ -162,6 +201,7 @@ fn concurrent_audit_lines_do_not_interleave() {
                     started_at: "start".into(),
                     finished_at: "finish".into(),
                     model: "model".into(),
+                    response_model: None,
                     request_bytes: 1,
                     response_bytes: 2,
                     upstream_http_status: Some(200),

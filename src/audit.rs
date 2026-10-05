@@ -24,6 +24,8 @@ pub struct AuditRecord {
     pub started_at: String,
     pub finished_at: String,
     pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_model: Option<String>,
     pub request_bytes: u64,
     pub response_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -93,6 +95,7 @@ pub fn timestamp() -> String {
 #[derive(Debug, Default)]
 pub struct Observation {
     pub response_id: Option<String>,
+    pub response_model: Option<String>,
     pub outcome: Option<String>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
@@ -171,6 +174,13 @@ impl SseObserver {
 
     fn observe(&mut self, value: &Value) {
         let response = value.get("response").unwrap_or(value);
+        if let Some(model) = response
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|model| !model.is_empty())
+        {
+            self.observation.response_model = Some(model.to_owned());
+        }
         if let Some(id) = response
             .get("id")
             .and_then(Value::as_str)

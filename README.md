@@ -175,7 +175,11 @@ New records identify the provider and operation (`responses`,
 request/response IDs, model, terminal outcome, and input/output token counts
 when observable from the SSE stream or image JSON. Images may also record a
 distinct `upstream_imagegen_request_id`; it is never substituted for a Responses
-ID. `upstream_http_status` is absent when an image operation fails before an
+ID. `model` is the requested model ID; Responses records also include
+`response_model` when upstream reports a nonempty model name in the SSE stream.
+Different names may reflect alias resolution, not necessarily an incorrect
+model. Images do not currently report a served model name.
+`upstream_http_status` is absent when an image operation fails before an
 upstream response is received. Existing records are left unchanged.
 Request bodies, response bodies, tokens, account data, headers,
 errors, and payload hashes are not retained. Bounded upstream error details are

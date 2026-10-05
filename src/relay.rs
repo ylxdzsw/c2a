@@ -175,6 +175,7 @@ impl Relay {
                 upstream_imagegen_request_id: None,
                 response_id: None,
                 outcome: "upstream_error".into(),
+                response_model: None,
                 input_tokens: None,
                 output_tokens: None,
             })
@@ -212,6 +213,7 @@ impl Relay {
                 upstream_imagegen_request_id: None,
                 response_id: None,
                 outcome: "upstream_error".into(),
+                response_model: None,
                 input_tokens: None,
                 output_tokens: None,
             })
@@ -283,6 +285,7 @@ impl Relay {
                 upstream_request_id: upstream_request_id_task,
                 upstream_imagegen_request_id: None,
                 response_id: observation.response_id.clone(),
+                response_model: observation.response_model.clone(),
                 outcome: final_outcome,
                 input_tokens: observation.input_tokens,
                 output_tokens: observation.output_tokens,
