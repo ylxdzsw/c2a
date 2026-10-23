@@ -28,6 +28,7 @@ use tokio::{
 use crate::{
     error::{ApiError, ApiErrorBody, Error, Result},
     images,
+    provider::Provider,
     relay::{self, Body, Operation, Relay, RequestMetadata},
 };
 
@@ -231,7 +232,7 @@ async fn handle_inner(
     };
     let bytes = collected.to_bytes();
     let validation = if operation == Operation::Responses {
-        validate_body(&bytes)
+        validate_body(&bytes, relay.provider())
     } else {
         images::validate(&bytes, operation)
     };
@@ -258,7 +259,10 @@ async fn handle_inner(
     }
 }
 
-fn validate_body(bytes: &[u8]) -> std::result::Result<RequestMetadata, &'static str> {
+fn validate_body(
+    bytes: &[u8],
+    provider: Provider,
+) -> std::result::Result<RequestMetadata, &'static str> {
     let value: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|_| "request body must be valid JSON")?;
     let object = value
@@ -271,6 +275,14 @@ fn validate_body(bytes: &[u8]) -> std::result::Result<RequestMetadata, &'static 
         .ok_or("model must be a nonempty string")?;
     if object.get("stream") != Some(&serde_json::Value::Bool(true)) {
         return Err("stream must be true");
+    }
+    if provider == Provider::Chatgpt {
+        if object.get("store") != Some(&serde_json::Value::Bool(false)) {
+            return Err("ChatGPT plan requests require store: false");
+        }
+        if !object.get("input").is_some_and(serde_json::Value::is_array) {
+            return Err("ChatGPT plan requests require input as an array");
+        }
     }
     Ok(RequestMetadata {
         operation: Operation::Responses,
@@ -417,7 +429,7 @@ mod tests {
     fn validation_does_not_rewrite_request_bytes() {
         let bytes = br#"{ "stream": true, "model": "gpt-5", "prompt_cache_key": "session-1", "service_tier": "priority", "input": [1, 2] }"#.to_vec();
         let original = bytes.clone();
-        let metadata = validate_body(&bytes).unwrap();
+        let metadata = validate_body(&bytes, crate::provider::Provider::Codex).unwrap();
         assert_eq!(metadata.model, "gpt-5");
         assert_eq!(metadata.prompt_cache_key.as_deref(), Some("session-1"));
         assert_eq!(metadata.service_tier.as_deref(), Some("priority"));

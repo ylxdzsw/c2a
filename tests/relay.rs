@@ -143,6 +143,38 @@ fn corrupt_copilot_credentials_do_not_stop_the_service() {
 }
 
 #[test]
+fn chatgpt_requires_stateless_streaming_and_exposes_no_image_or_decision_routes() {
+    let server = Server::start("chatgpt");
+    for body in [
+        br#"{"model":"m","stream":true,"input":[]}"#.as_slice(),
+        br#"{"model":"m","stream":true,"store":true,"input":[]}"#,
+        br#"{"model":"m","stream":true,"store":false,"input":"hello"}"#,
+        br#"{"model":"m","stream":false,"store":false,"input":[]}"#,
+    ] {
+        assert_eq!(
+            status(&server.post("/v1/responses", body, "application/json")),
+            400
+        );
+    }
+    // Valid native bytes reach credential acquisition, but empty state prevents network access.
+    assert_eq!(
+        status(&server.post(
+            "/v1/responses",
+            br#"{ "model":"m", "stream":true, "store":false, "input":[], "unknown_option":42 }"#,
+            "application/json"
+        )),
+        502
+    );
+    for path in [
+        "/v1/images/generations",
+        "/v1/images/edits",
+        "/v1/decisions",
+    ] {
+        assert_eq!(status(&server.post(path, b"{}", "application/json")), 404);
+    }
+}
+
+#[test]
 fn validates_native_streaming_body() {
     assert_eq!(status(&post(b"{bad", "application/json")), 400);
     assert_eq!(status(&post(b"[]", "application/json")), 400);

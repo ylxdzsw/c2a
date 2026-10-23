@@ -1,15 +1,16 @@
 # c2a
 
 `c2a` exposes native OpenAI APIs on local Unix sockets. It relays streaming
-Responses requests to either a ChatGPT Codex subscription or a GitHub Copilot
-subscription, and JSON Images requests to Codex. It is Linux-only and supports
-one login for each provider.
+Responses requests to a ChatGPT Codex subscription, a GitHub Copilot
+subscription, or ChatGPT plan usage through Sign in with ChatGPT (SIWC), and
+JSON Images requests to Codex. It is Linux-only and supports one login for each
+provider.
 
-| Endpoint | Codex | Copilot |
-| --- | --- | --- |
-| `POST /v1/responses` (`stream: true`) | Yes | Yes |
-| `POST /v1/images/generations` (JSON) | Yes | No |
-| `POST /v1/images/edits` (JSON) | Yes | No |
+| Endpoint | Codex | Copilot | ChatGPT (SIWC) |
+| --- | --- | --- | --- |
+| `POST /v1/responses` (`stream: true`) | Yes | Yes | Yes, `store: false` |
+| `POST /v1/images/generations` (JSON) | Yes | No | No |
+| `POST /v1/images/edits` (JSON) | Yes | No | No |
 
 ## Build and install
 
@@ -18,8 +19,9 @@ cargo build --release
 install -Dm755 target/release/c2a /usr/bin/c2a
 ```
 
-The binary uses each provider's device login flow and identifies upstream as
-`c2a`. Provider compatibility details may change without notice.
+Codex and Copilot use device login. ChatGPT uses browser OAuth with PKCE and a
+temporary loopback callback, with a pasted-URL fallback for remote browsers.
+All providers identify upstream as `c2a`. Compatibility details may change.
 
 ## Login and status
 
@@ -33,25 +35,114 @@ c2a copilot login
 c2a copilot status
 c2a copilot quota
 c2a copilot logout
+
+c2a chatgpt login
+c2a chatgpt status
+c2a chatgpt quota
+c2a chatgpt logout
 ```
 
 `quota` fetches the provider's current remaining allowance. Reset timestamps are
 shown in local time with the remaining days, hours, and minutes.
 Codex reports percentage remaining for each usage window. Copilot reports AI
 credits on current plans and premium requests on legacy plans.
+For ChatGPT, `quota` prints the ChatGPT usage-settings link instead of querying
+an undocumented quota endpoint.
 
 Credentials and audit records are stored under `$XDG_STATE_HOME/c2a`, or
 `~/.local/state/c2a` when `XDG_STATE_HOME` is unset. The state directory must be
-owned by the current user with mode `0700`; `codex.json`, `copilot.json`, and
-`audit.jsonl` must be regular user-owned files with mode `0600`. Credential
+owned by the current user with mode `0700`; `codex.json`, `copilot.json`,
+`chatgpt.json`, and `audit.jsonl` must be regular user-owned files with mode `0600`. Credential
 files are directly locked during reads and writes. If a nonempty credential
-file is corrupt, log in to that provider again to replace it.
+file is corrupt, Codex or Copilot login can replace it. ChatGPT login refuses
+corrupt state rather than silently losing its retained client and host identity.
+
+## Sign in with ChatGPT
+
+The `chatgpt` provider uses OpenAI's documented local/open-source SIWC flow and
+the public `https://api.openai.com/v1/responses` endpoint. It is separate from
+the `codex` provider: their credentials and upstreams are not interchangeable.
+Automated checks use offline fixtures. Sign-in has been reported working from
+an iOS browser; live inference has not yet been smoke-tested. Account eligibility,
+model availability, and preview restrictions remain subject to OpenAI's backend.
+
+Run `c2a chatgpt login` and open the printed authorization link. You can use a
+browser on the same machine, a phone, or another computer:
+
+1. Sign in to ChatGPT and approve c2a's identity and plan-usage permissions.
+2. On the same machine, the browser normally reaches c2a's temporary listener
+   at `http://127.0.0.1:<port>/auth/callback` automatically.
+3. On another device, that address refers to the browser's device and normally
+   fails to load. Copy the **complete final URL from the address bar** and paste
+   it into the waiting c2a command and **press Enter**. Input is hidden: no
+   pasted characters will appear. c2a prints a confirmation when it accepts the
+   callback. Do not paste it into a shell command, a log, or a support message.
+   If iOS omits `http://` when copying, a URL beginning with
+   `127.0.0.1:<port>/auth/callback?...` is also accepted.
+4. Keep the login process running; it retains the secret PKCE verifier. The
+   callback must match that attempt's address and state. c2a exchanges the code
+   directly with OpenAI and verifies the signed ID token before using credentials.
+
+Login has a 15-minute deadline; authorization codes may expire sooner. The
+phone never needs to reach the server, and no public callback, SSH tunnel, or
+credential-file transfer is needed for this fallback. Mobile browsers must
+retain the failed callback URL for copying. Browser-specific behavior and the
+live SIWC flow still need verification. The inference service remains Unix-only;
+only the login command temporarily listens on TCP, bound to `127.0.0.1`.
+
+`chatgpt.json` retains a stable random host ID, the issued client ID, and the
+verified subject. Successful sessions also contain granted scopes, tokens, and
+expiry/refresh timing. Logout attempts to revoke the renewable session, clears
+local tokens, and retains the registration for later sign-in to the same account
+and workspace. c2a does not maintain a profile/account pool. It omits ID-token
+login hints so printed authorization links contain no tokens. ID tokens are
+only retained temporarily in an unusable pending-refresh checkpoint when
+signature verification needs to recover from an unavailable key service.
+
+Refreshes are serialized across processes. A replacement refresh token is
+checkpointed before key retrieval, and a started refresh finishes saving even
+if its caller disconnects. Storage keeps c2a's existing locked, in-place writes
+and `sync_all`, not atomic rename: an interrupted write can still require
+credential recovery. SIWC refresh is proactive; a direct-route `401` is returned
+unchanged rather than assuming every authorization failure needs a refresh.
+
+Each request must include `stream: true`, `store: false`, a nonempty `model`,
+and an `input` array containing the required context. c2a forwards the original
+bytes; it does not remove unsupported options or transform tools. The preview
+does not support HTTP `previous_response_id`, several ordinary Responses
+parameters, or hosted image generation/file search/Code Interpreter/MCP tools.
+Image inputs are distinct from image generation. Neither Images nor Decisions
+routes are exposed on the ChatGPT socket. See the current
+[SIWC limitations](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations)
+before adapting an existing client. SIWC HTTP error bodies and machine-readable
+codes pass through, bounded to 64 KiB; SSE errors pass through unchanged.
+
+Plan usage must actually be granted; identity sign-in alone cannot power
+inference. Usage draws on the existing allowance and app-specific limits, not a
+new pool. Credits may be consumed if the user enables them in ChatGPT. c2a does
+not silently fall back to Codex, Copilot, or API billing. Manage permissions and
+limits at <https://chatgpt.com/settings/usage>.
+
+Implementation references reviewed on 2026-10-23 (no third-party source copied):
+
+- [OpenAI's SIWC contract](https://developers.openai.com/siwc/token-sharing-open-source/sign-in)
+  and published OIDC discovery/JWKS/revocation endpoints.
+- [CLIProxyAPI, `d946c4f`](https://github.com/router-for-me/CLIProxyAPI/blob/d946c4fba6fc9a5cfbca1f3d85184d62ad2fb683/internal/api/handlers/management/oauth_siwc.go)
+  (MIT): remote full-URL callback validation and server-owned pending attempts.
+- [Pi, `936e5f4`](https://github.com/earendil-works/pi/blob/936e5f40aede9327b9142b63506ed2b68bc6b4ac/packages/ai/src/auth/oauth/openai-chatgpt.ts)
+  (MIT): separate SIWC provider and racing browser/manual callback paths.
+- OpenCode `2a381f8` and Codex CLI `8531184` were reviewed as older Codex OAuth
+  implementations, not evidence that their credentials work with SIWC.
+
+The implementation uses a Rust JWT verifier for signed identity checks; it does
+not embed OpenAI's noncommercial Node DevKit.
 
 ## Run manually
 
 ```bash
 c2a codex serve /run/user/$(id -u)/c2a/codex.sock
 c2a copilot serve /run/user/$(id -u)/c2a/copilot.sock
+c2a chatgpt serve /run/user/$(id -u)/c2a/chatgpt.sock
 ```
 
 The socket path must not already exist. The service removes only a socket it
@@ -65,6 +156,7 @@ install -Dm644 c2a@.socket /usr/lib/systemd/system/c2a@.socket
 systemctl daemon-reload
 systemctl enable --now c2a@codex.socket
 systemctl enable --now c2a@copilot.socket
+systemctl enable --now c2a@chatgpt.socket
 ```
 
 On Arch Linux, build and install the package instead:
@@ -74,7 +166,8 @@ makepkg -si
 ```
 
 The system service runs as root, stores state under `/root/.local/state/c2a`, and
-activates `/run/c2a/codex.sock` and `/run/c2a/copilot.sock` with mode `0600`.
+activates `/run/c2a/codex.sock`, `/run/c2a/copilot.sock`, and
+`/run/c2a/chatgpt.sock` with mode `0600` when their instances are enabled.
 
 ## Configure mu
 

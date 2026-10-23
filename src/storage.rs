@@ -36,6 +36,33 @@ pub struct CopilotCredentials {
     pub refresh_expires_at: Option<i64>,
 }
 
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ChatgptState {
+    pub version: u8,
+    pub host_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<ChatgptSession>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_refresh: Option<ChatgptSession>,
+}
+
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ChatgptSession {
+    pub access_token: String,
+    pub refresh_token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id_token: Option<String>,
+    pub scopes: Vec<String>,
+    pub expires_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub earliest_refresh_at: Option<i64>,
+    pub received_at: i64,
+}
+
 pub struct CredentialLock {
     file: File,
     provider: Provider,
@@ -56,6 +83,14 @@ impl CredentialLock {
         }
         let value = read_json(&mut self.file)?;
         validate_copilot(value)
+    }
+
+    pub fn load_chatgpt(&mut self) -> Result<Option<ChatgptState>> {
+        if self.provider != Provider::Chatgpt {
+            return Err(Error::message("credential provider mismatch"));
+        }
+        let value = read_chatgpt(&mut self.file)?;
+        validate_chatgpt(value)
     }
 
     pub fn store<T: Serialize>(&mut self, credentials: &T) -> Result<()> {
@@ -90,6 +125,14 @@ pub fn load_copilot(paths: &Paths) -> Result<Option<CopilotCredentials>> {
     let mut file = open(paths, Provider::Copilot)?;
     flock(&file, libc::LOCK_SH)?;
     let result = validate_copilot(read_json(&mut file)?);
+    flock(&file, libc::LOCK_UN)?;
+    result
+}
+
+pub fn load_chatgpt(paths: &Paths) -> Result<Option<ChatgptState>> {
+    let mut file = open(paths, Provider::Chatgpt)?;
+    flock(&file, libc::LOCK_SH)?;
+    let result = validate_chatgpt(read_chatgpt(&mut file)?);
     flock(&file, libc::LOCK_UN)?;
     result
 }
@@ -190,4 +233,45 @@ fn validate_copilot(value: Option<CopilotCredentials>) -> Result<Option<CopilotC
         ));
     }
     Ok(value)
+}
+
+fn read_chatgpt(file: &mut File) -> Result<Option<ChatgptState>> {
+    read_json(file).map_err(|_| Error::message("could not read ChatGPT credentials"))
+}
+
+fn validate_chatgpt(value: Option<ChatgptState>) -> Result<Option<ChatgptState>> {
+    if let Some(state) = &value
+        && (state.version != 1
+            || state.host_id.is_empty()
+            || state.client_id.as_deref().is_some_and(|client_id| {
+                client_id.is_empty() || client_id == "dynamic_agent_client"
+            })
+            || ((state.session.is_some() || state.pending_refresh.is_some())
+                && (state.client_id.is_none()
+                    || state.subject.as_deref().is_none_or(str::is_empty)))
+            || state
+                .session
+                .as_ref()
+                .is_some_and(|session| !valid_chatgpt_session(session))
+            || state
+                .pending_refresh
+                .as_ref()
+                .is_some_and(|session| !valid_chatgpt_session(session)))
+    {
+        return Err(Error::message(
+            "invalid ChatGPT credentials; run `c2a chatgpt login`",
+        ));
+    }
+    Ok(value)
+}
+
+fn valid_chatgpt_session(session: &ChatgptSession) -> bool {
+    !session.access_token.is_empty()
+        && !session.refresh_token.is_empty()
+        && session
+            .id_token
+            .as_deref()
+            .is_none_or(|token| !token.is_empty())
+        && session.expires_at > session.received_at
+        && session.received_at > 0
 }

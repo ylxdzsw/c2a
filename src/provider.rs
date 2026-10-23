@@ -6,6 +6,7 @@ pub const USER_AGENT: &str = concat!("c2a/", env!("CARGO_PKG_VERSION"));
 pub enum Provider {
     Codex,
     Copilot,
+    Chatgpt,
 }
 
 impl Provider {
@@ -14,6 +15,8 @@ impl Provider {
             Some(Self::Codex)
         } else if value == "copilot" {
             Some(Self::Copilot)
+        } else if value == "chatgpt" {
+            Some(Self::Chatgpt)
         } else {
             None
         }
@@ -23,6 +26,7 @@ impl Provider {
         match self {
             Self::Codex => "codex",
             Self::Copilot => "copilot",
+            Self::Chatgpt => "chatgpt",
         }
     }
 }

@@ -1,4 +1,5 @@
 mod audit;
+mod chatgpt;
 mod claims;
 mod copilot;
 mod device;
@@ -20,7 +21,7 @@ use error::{Error, Result};
 use paths::Paths;
 use provider::Provider;
 
-const USAGE: &str = "usage: c2a <codex|copilot> <login|status|quota|logout|serve [SOCKET]>";
+const USAGE: &str = "usage: c2a <codex|copilot|chatgpt> <login|status|quota|logout|serve [SOCKET]>";
 
 fn main() -> ExitCode {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -79,7 +80,7 @@ async fn run(args: Vec<OsString>) -> std::result::Result<(), MainError> {
             quota(parse_provider(provider)?).await.map_err(Into::into)
         }
         [provider, command] if command == "logout" => {
-            logout(parse_provider(provider)?).map_err(Into::into)
+            logout(parse_provider(provider)?).await.map_err(Into::into)
         }
         [provider, command] if command == "serve" => serve(parse_provider(provider)?, None)
             .await
@@ -111,6 +112,7 @@ fn client() -> Result<reqwest::Client> {
 async fn login(provider: Provider) -> Result<()> {
     let paths = Paths::new()?;
     match provider {
+        Provider::Chatgpt => chatgpt::login(&client()?, &paths).await?,
         Provider::Codex => {
             let credentials = device::login(&client()?).await?;
             storage::store_codex(&paths, &credentials)?;
@@ -126,6 +128,29 @@ async fn login(provider: Provider) -> Result<()> {
 async fn status(provider: Provider) -> Result<()> {
     let paths = Paths::new()?;
     match provider {
+        Provider::Chatgpt => {
+            let Some(saved) = storage::load_chatgpt(&paths)? else {
+                println!("not logged in");
+                return Ok(());
+            };
+            if let Some(session) = saved.session.as_ref() {
+                println!(
+                    "logged in\nChatGPT plan usage: {}\nexpires: {}",
+                    if chatgpt::sharing(session) {
+                        "enabled"
+                    } else {
+                        "not authorized"
+                    },
+                    format_expiry(Some(session.expires_at))
+                );
+            } else {
+                println!("not logged in");
+            }
+            if saved.pending_refresh.is_some() {
+                println!("token refresh pending verification; retry a request to recover");
+            }
+            println!("Manage usage: {}", chatgpt::USAGE_URL);
+        }
         Provider::Codex => {
             let Some(credentials) = storage::load_codex(&paths)? else {
                 println!("not logged in");
@@ -162,6 +187,10 @@ async fn quota(provider: Provider) -> Result<()> {
     let paths = Paths::new()?;
     let client = client()?;
     let output = match provider {
+        Provider::Chatgpt => format!(
+            "ChatGPT app limits and remaining usage: {}",
+            chatgpt::USAGE_URL
+        ),
         Provider::Codex => {
             let (credentials, claims) = refresh::credentials(&client, &paths, None).await?;
             let quota =
@@ -333,9 +362,13 @@ fn format_remaining(reset_at: DateTime<Utc>, now: DateTime<Utc>) -> String {
     format!("{days}d {hours}h {minutes}m")
 }
 
-fn logout(provider: Provider) -> Result<()> {
+async fn logout(provider: Provider) -> Result<()> {
     let paths = Paths::new()?;
-    storage::clear(&paths, provider)?;
+    if provider == Provider::Chatgpt {
+        chatgpt::logout(&client()?, &paths).await?;
+    } else {
+        storage::clear(&paths, provider)?;
+    }
     println!("logged out");
     Ok(())
 }

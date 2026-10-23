@@ -16,6 +16,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
 use crate::{
     audit::{self, Audit, AuditRecord},
+    chatgpt,
     claims::Claims,
     copilot, device,
     error::{ApiError, ApiErrorBody, Error, Result},
@@ -114,6 +115,10 @@ impl Relay {
         }
     }
 
+    pub fn provider(&self) -> Provider {
+        self.provider
+    }
+
     pub async fn start(
         self: &Arc<Self>,
         body: Bytes,
@@ -180,6 +185,21 @@ impl Relay {
                 output_tokens: None,
             })
             .await;
+            if self.provider == Provider::Chatgpt {
+                let mut builder = Response::builder().status(upstream_status);
+                if let Some(value) = response.headers().get(reqwest::header::CONTENT_TYPE) {
+                    builder = builder.header(CONTENT_TYPE, value.as_bytes());
+                }
+                if let Some(value) = retry_after {
+                    builder = builder.header(RETRY_AFTER, value.as_bytes());
+                }
+                if let Some(value) = upstream_request_id {
+                    builder = builder.header("x-request-id", value);
+                }
+                return builder
+                    .body(full(error_body))
+                    .map_err(|error| Error::message(error.to_string()));
+            }
             let detail = upstream_error_detail(&error_body)
                 .map(|detail| format!(": {detail}"))
                 .unwrap_or_default();
@@ -321,7 +341,11 @@ impl Relay {
         metadata: &RequestMetadata,
     ) -> Result<reqwest::Response> {
         let mut sent = self.send(body, metadata, None).await?;
-        if sent.response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        // SIWC admission 401s can indicate permissions, not an expired token.
+        // Refresh proactively; preserve direct-route authorization failures.
+        if self.provider != Provider::Chatgpt
+            && sent.response.status() == reqwest::StatusCode::UNAUTHORIZED
+        {
             let rejected_access_token = sent.access_token;
             drop(sent.response);
             sent = self
@@ -338,6 +362,19 @@ impl Relay {
         rejected_access_token: Option<&str>,
     ) -> Result<Sent> {
         match self.provider {
+            Provider::Chatgpt => {
+                let _guard = self.credentials.lock().await;
+                let credentials =
+                    chatgpt::credentials(&self.client, &self.paths, rejected_access_token).await?;
+                let access_token = credentials.access_token;
+                drop(_guard);
+                Ok(Sent {
+                    response: chatgpt_request(&self.client, body.clone(), &access_token)
+                        .send()
+                        .await?,
+                    access_token,
+                })
+            }
             Provider::Codex => {
                 let _guard = self.credentials.lock().await;
                 let (credentials, claims) =
@@ -425,6 +462,20 @@ async fn next_or_shutdown(
     tokio::time::timeout(STREAM_IDLE_TIMEOUT, race)
         .await
         .unwrap_or(Next::Idle)
+}
+
+fn chatgpt_request(
+    client: &reqwest::Client,
+    body: Bytes,
+    access_token: &str,
+) -> reqwest::RequestBuilder {
+    client
+        .post(chatgpt::UPSTREAM)
+        .bearer_auth(access_token)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(reqwest::header::ACCEPT, "text/event-stream")
+        .header(reqwest::header::USER_AGENT, USER_AGENT)
+        .body(body)
 }
 
 fn codex_request(
@@ -588,10 +639,32 @@ pub fn full(bytes: impl Into<Bytes>) -> Body {
 #[cfg(test)]
 mod tests {
     use super::{
-        Operation, RequestMetadata, accepts_content_type, codex_request, copilot_request,
-        upstream_error_detail, upstream_error_response,
+        Operation, RequestMetadata, accepts_content_type, chatgpt_request, codex_request,
+        copilot_request, upstream_error_detail, upstream_error_response,
     };
     use crate::{claims::Claims, copilot, device, provider::USER_AGENT, storage::CodexCredentials};
+
+    #[test]
+    fn chatgpt_request_preserves_native_bytes_without_codex_headers() {
+        let bytes = hyper::body::Bytes::from_static(
+            br#"{ "model":"m", "stream":true, "store":false, "input":[] }"#,
+        );
+        let request = chatgpt_request(&reqwest::Client::new(), bytes.clone(), "access")
+            .build()
+            .unwrap();
+        assert_eq!(request.url().as_str(), crate::chatgpt::UPSTREAM);
+        assert_eq!(request.body().unwrap().as_bytes().unwrap(), bytes);
+        assert_eq!(request.headers()["authorization"], "Bearer access");
+        assert_eq!(request.headers()["user-agent"], USER_AGENT);
+        for name in [
+            "originator",
+            "chatgpt-account-id",
+            device::SESSION_ID_HEADER,
+            device::ROUTING_HINT_HEADER,
+        ] {
+            assert!(request.headers().get(name).is_none());
+        }
+    }
 
     #[test]
     fn image_requests_use_native_paths_and_preserve_bytes() {

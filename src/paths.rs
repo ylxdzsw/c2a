@@ -13,6 +13,7 @@ pub struct Paths {
     pub dir: PathBuf,
     pub codex: PathBuf,
     pub copilot: PathBuf,
+    pub chatgpt: PathBuf,
     pub audit: PathBuf,
 }
 
@@ -37,6 +38,7 @@ impl Paths {
         Ok(Self {
             codex: dir.join("codex.json"),
             copilot: dir.join("copilot.json"),
+            chatgpt: dir.join("chatgpt.json"),
             audit: dir.join("audit.jsonl"),
             dir,
         })
@@ -46,6 +48,7 @@ impl Paths {
         match provider {
             Provider::Codex => &self.codex,
             Provider::Copilot => &self.copilot,
+            Provider::Chatgpt => &self.chatgpt,
         }
     }
 

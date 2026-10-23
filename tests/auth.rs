@@ -17,7 +17,7 @@ mod provider;
 mod storage;
 
 use paths::Paths;
-use storage::{CodexCredentials, CopilotCredentials};
+use storage::{ChatgptState, CodexCredentials, CopilotCredentials};
 
 fn temp_dir() -> PathBuf {
     let mut random = [0u8; 16];
@@ -39,6 +39,7 @@ fn paths(root: PathBuf) -> Paths {
     Paths {
         codex: dir.join("codex.json"),
         copilot: dir.join("copilot.json"),
+        chatgpt: dir.join("chatgpt.json"),
         audit: dir.join("audit.jsonl"),
         dir,
     }
@@ -168,5 +169,119 @@ fn corrupt_provider_credentials_can_be_overwritten_independently() {
         storage::load_codex(&paths).unwrap().unwrap().access_token,
         "new-access"
     );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn chatgpt_registration_roundtrips_without_a_session_in_private_file() {
+    let root = temp_dir();
+    let paths = paths(root.clone());
+    assert_eq!(
+        provider::Provider::parse(std::ffi::OsStr::new("chatgpt")),
+        Some(provider::Provider::Chatgpt)
+    );
+    assert_eq!(provider::Provider::Chatgpt.as_str(), "chatgpt");
+    let state = ChatgptState {
+        version: 1,
+        host_id: "host-1".into(),
+        client_id: Some("oaiapp_registered".into()),
+        subject: Some("subject-1".into()),
+        session: None,
+        pending_refresh: None,
+    };
+
+    storage::lock(&paths, provider::Provider::Chatgpt)
+        .unwrap()
+        .store(&state)
+        .unwrap();
+
+    assert_eq!(fs::metadata(&paths.dir).unwrap().mode() & 0o777, 0o700);
+    assert_eq!(fs::metadata(&paths.chatgpt).unwrap().mode() & 0o777, 0o600);
+    let loaded = storage::load_chatgpt(&paths).unwrap().unwrap();
+    assert!(loaded == state);
+    let value: serde_json::Value =
+        serde_json::from_slice(&fs::read(&paths.chatgpt).unwrap()).unwrap();
+    assert_eq!(value["client_id"], "oaiapp_registered");
+    assert_eq!(value["subject"], "subject-1");
+    assert!(value.get("session").is_none());
+    assert!(value.get("pending_refresh").is_none());
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn invalid_chatgpt_states_are_rejected() {
+    let root = temp_dir();
+    let paths = paths(root.clone());
+    paths.ensure_dir().unwrap();
+    fs::write(
+        &paths.chatgpt,
+        r#"{"version":1,"host_id":"host-1","client_id":"dynamic_agent_client","subject":"subject-1"}"#,
+    )
+    .unwrap();
+    fs::set_permissions(&paths.chatgpt, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(storage::load_chatgpt(&paths).is_err());
+
+    fs::write(
+        &paths.chatgpt,
+        r#"{"version":1,"host_id":"host-1","client_id":"oaiapp_registered","subject":"subject-1","session":{"access_token":"access","refresh_token":"refresh","scopes":[],"expires_at":10,"received_at":10}}"#,
+    )
+    .unwrap();
+    fs::set_permissions(&paths.chatgpt, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(storage::load_chatgpt(&paths).is_err());
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn chatgpt_credentials_use_an_independent_provider_file() {
+    let root = temp_dir();
+    let paths = paths(root.clone());
+    storage::store_codex(
+        &paths,
+        &CodexCredentials {
+            version: 1,
+            access_token: "codex-access".into(),
+            refresh_token: "codex-refresh".into(),
+        },
+    )
+    .unwrap();
+    storage::store_copilot(
+        &paths,
+        &CopilotCredentials {
+            version: 1,
+            access_token: "copilot-access".into(),
+            expires_at: None,
+            refresh_token: None,
+            refresh_expires_at: None,
+        },
+    )
+    .unwrap();
+    storage::lock(&paths, provider::Provider::Chatgpt)
+        .unwrap()
+        .store(&ChatgptState {
+            version: 1,
+            host_id: "host-1".into(),
+            client_id: None,
+            subject: None,
+            session: None,
+            pending_refresh: None,
+        })
+        .unwrap();
+
+    assert_eq!(
+        storage::load_codex(&paths).unwrap().unwrap().access_token,
+        "codex-access"
+    );
+    assert_eq!(
+        storage::load_copilot(&paths).unwrap().unwrap().access_token,
+        "copilot-access"
+    );
+    assert_eq!(
+        storage::load_chatgpt(&paths).unwrap().unwrap().host_id,
+        "host-1"
+    );
+    assert_ne!(paths.credentials(provider::Provider::Codex), &paths.chatgpt);
+
     fs::remove_dir_all(root).unwrap();
 }
