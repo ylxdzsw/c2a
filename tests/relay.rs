@@ -104,6 +104,7 @@ fn validates_path_method_and_content_type() {
     let not_found =
         server.request(b"GET /other HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
     assert_eq!(status(&not_found), 404);
+    assert!(String::from_utf8_lossy(&not_found).contains("\"type\":\"proxy_error\""));
     let method = server
         .request(b"GET /v1/responses HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
     assert_eq!(status(&method), 405);

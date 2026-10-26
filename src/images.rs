@@ -148,6 +148,7 @@ pub fn validate(
         model: request.model.into_owned(),
         prompt_cache_key: None,
         service_tier: None,
+        identity_headers: Default::default(),
     })
 }
 

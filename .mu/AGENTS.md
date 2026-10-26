@@ -60,11 +60,14 @@ All application modules are intentionally flat under `src/`.
 
 The original local request bytes are retained only for the duration of the
 relay and sent unchanged upstream. c2a validates a parsed JSON representation
-but does not serialize it back into a new request. Local headers are not
-forwarded. Both providers use `User-Agent: c2a/<package-version>`. Codex also
-uses `originator: c2a`; it does not send a Codex `version` header or the
-Responses Lite header. Copilot sends the current GitHub API version but no
-borrowed editor, plugin, integration, initiator, intent, vision, or request-ID
+but does not serialize it back into a new request. Only downstream `User-Agent`
+and `originator` headers are forwarded on all Responses and Images routes;
+absent values remain absent, with no c2a identity defaults. These headers are
+not audited. Login, refresh, discovery, and status requests retain c2a's own
+User-Agent; ChatGPT application registration is unchanged. Codex does not send
+a `version` header or the Responses Lite header. Copilot sends the current
+GitHub API version but no borrowed editor, plugin, integration, initiator,
+intent, vision, or request-ID
 identity headers. Successful Responses upstreams may omit `Content-Type`, in
 which case c2a synthesizes `text/event-stream`; an explicitly wrong content
 type is rejected. c2a copies only content type, cache control, and a sanitized
@@ -85,8 +88,8 @@ translation, filesystem image loading, URL fetching, or fallback is implemented.
 Require nonempty model and prompt; stream must be absent or false. Edits take
 one to five `images: [{image_url: ...}]` entries. Pass model IDs and unknown
 options unchanged; do not pin the service to the first-party default image model.
-Use existing bearer/account authentication and honest c2a identity, without
-Responses routing/session headers or borrowed Codex image-turn identity.
+Use existing bearer/account authentication and downstream identity headers,
+without Responses routing/session headers or borrowed Codex image-turn identity.
 
 Requests and successful responses are bounded to 64 MiB each. Two Images
 operations share the existing 16-relay budget. Acquire admission before body
@@ -118,10 +121,10 @@ Provider compatibility details are compiled into `device.rs` and `copilot.rs`:
 - Auth base: `https://auth.openai.com`
 - Responses upstream: `https://chatgpt.com/backend-api/codex/responses`
 - Client ID used by the current Codex device flow
-- Upstream identity: `originator: c2a` and `User-Agent: c2a/<package-version>`
+- Relayed identity: downstream `originator` and `User-Agent`, omitted if absent
 - GitHub device OAuth endpoints and the OpenCode public OAuth client ID
 - GitHub account and Copilot endpoint discovery endpoints
-- Copilot API version and `User-Agent: c2a/<package-version>`
+- Copilot API version and control-plane `User-Agent: c2a/<package-version>`
 
 Keep these values centralized. When Codex changes its private protocol, update
 `device.rs`; when GitHub or Copilot changes its protocol, update `copilot.rs`.
@@ -132,8 +135,8 @@ As probed against the live Copilot backend on 2026-08-18,
 `gpt-5.6-luna` accepts a native streaming Responses request with only bearer
 authorization and JSON content type. It does not require
 `Copilot-Integration-Id`, `Editor-Version`, `Editor-Plugin-Version`,
-`X-Initiator`, `OpenAI-Intent`, or an explicit API-version header. Keep c2a's
-honest User-Agent and current API-version header, but do not add borrowed
+`X-Initiator`, `OpenAI-Intent`, or an explicit API-version header. Keep the
+current API-version header, but do not synthesize borrowed
 integration identity without fresh evidence.
 
 c2a always uses full Responses, including for models that official Codex may

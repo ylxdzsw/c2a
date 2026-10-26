@@ -19,7 +19,6 @@ pub const UPSTREAM: &str = "https://chatgpt.com/backend-api/codex/responses";
 pub const IMAGE_GENERATIONS: &str = "https://chatgpt.com/backend-api/codex/images/generations";
 pub const IMAGE_EDITS: &str = "https://chatgpt.com/backend-api/codex/images/edits";
 pub const QUOTA_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
-pub const ORIGINATOR: &str = "c2a";
 pub const SESSION_ID_HEADER: &str = "session-id";
 pub const ROUTING_HINT_HEADER: &str = "x-codex-routing-hint";
 

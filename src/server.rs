@@ -13,7 +13,7 @@ use std::{
 
 use http_body_util::{BodyExt, LengthLimitError, Limited};
 use hyper::{
-    Method, Request, Response, StatusCode,
+    HeaderMap, Method, Request, Response, StatusCode,
     body::Incoming,
     header::{ALLOW, CONTENT_TYPE},
     service::service_fn,
@@ -205,6 +205,7 @@ async fn handle_inner(
     {
         return Ok(too_large());
     }
+    let identity_headers = forwarded_identity_headers(request.headers());
     let collected = match tokio::time::timeout(
         Duration::from_secs(60),
         Limited::new(request.into_body(), limit).collect(),
@@ -236,7 +237,7 @@ async fn handle_inner(
     } else {
         images::validate(&bytes, operation)
     };
-    let metadata = match validation {
+    let mut metadata = match validation {
         Ok(metadata) => metadata,
         Err(message) => {
             return Ok(json_error_with_id(
@@ -246,6 +247,7 @@ async fn handle_inner(
             ));
         }
     };
+    metadata.identity_headers = identity_headers;
     match relay
         .start(bytes, metadata, request_id.clone(), permits, shutdown)
         .await
@@ -257,6 +259,16 @@ async fn handle_inner(
             &request_id,
         )),
     }
+}
+
+fn forwarded_identity_headers(headers: &HeaderMap) -> HeaderMap {
+    let mut forwarded = HeaderMap::new();
+    for name in ["user-agent", "originator"] {
+        for value in headers.get_all(name) {
+            forwarded.append(name, value.clone());
+        }
+    }
+    forwarded
 }
 
 fn validate_body(
@@ -287,6 +299,7 @@ fn validate_body(
     Ok(RequestMetadata {
         operation: Operation::Responses,
         model: model.to_owned(),
+        identity_headers: HeaderMap::new(),
         prompt_cache_key: object
             .get("prompt_cache_key")
             .and_then(serde_json::Value::as_str)
@@ -314,7 +327,7 @@ fn json_error_with_id(status: StatusCode, message: &str, id: &str) -> Response<B
     let bytes = serde_json::to_vec(&ApiError {
         error: ApiErrorBody {
             message,
-            r#type: "c2a_error",
+            r#type: "proxy_error",
             request_id: id,
         },
     })
@@ -423,7 +436,30 @@ pub fn socket_argument(value: OsString) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_body;
+    use super::{forwarded_identity_headers, validate_body};
+
+    #[test]
+    fn only_identity_headers_are_selected_for_forwarding() {
+        let mut headers = hyper::HeaderMap::new();
+        assert!(forwarded_identity_headers(&headers).is_empty());
+        for (name, value) in [
+            ("User-Agent", "mu/1.0"),
+            ("Originator", "mu"),
+            ("Authorization", "Bearer downstream"),
+            ("Chatgpt-Account-Id", "downstream-account"),
+            ("Content-Type", "text/plain"),
+            ("X-Request-Id", "downstream-id"),
+        ] {
+            headers.insert(
+                hyper::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        let forwarded = forwarded_identity_headers(&headers);
+        assert_eq!(forwarded.len(), 2);
+        assert_eq!(forwarded["user-agent"], "mu/1.0");
+        assert_eq!(forwarded["originator"], "mu");
+    }
 
     #[test]
     fn validation_does_not_rewrite_request_bytes() {

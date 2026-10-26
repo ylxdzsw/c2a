@@ -8,7 +8,7 @@ use std::{
 
 use http_body_util::{BodyExt, Channel, Full, combinators::BoxBody};
 use hyper::{
-    Response, StatusCode,
+    HeaderMap, Response, StatusCode,
     body::Bytes,
     header::{CONTENT_TYPE, HeaderName, HeaderValue, RETRY_AFTER},
 };
@@ -22,7 +22,7 @@ use crate::{
     error::{ApiError, ApiErrorBody, Error, Result},
     images,
     paths::Paths,
-    provider::{Provider, USER_AGENT},
+    provider::Provider,
     refresh,
     storage::CodexCredentials,
 };
@@ -64,6 +64,7 @@ pub struct RequestMetadata {
     pub model: String,
     pub prompt_cache_key: Option<String>,
     pub service_tier: Option<String>,
+    pub identity_headers: HeaderMap,
 }
 
 pub struct Relay {
@@ -369,7 +370,7 @@ impl Relay {
                 let access_token = credentials.access_token;
                 drop(_guard);
                 Ok(Sent {
-                    response: chatgpt_request(&self.client, body.clone(), &access_token)
+                    response: chatgpt_request(&self.client, body.clone(), metadata, &access_token)
                         .send()
                         .await?,
                     access_token,
@@ -400,6 +401,7 @@ impl Relay {
                     response: copilot_request(
                         &self.client,
                         body,
+                        metadata,
                         &endpoint,
                         &credentials.access_token,
                     )
@@ -467,6 +469,7 @@ async fn next_or_shutdown(
 fn chatgpt_request(
     client: &reqwest::Client,
     body: Bytes,
+    metadata: &RequestMetadata,
     access_token: &str,
 ) -> reqwest::RequestBuilder {
     client
@@ -474,7 +477,7 @@ fn chatgpt_request(
         .bearer_auth(access_token)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .header(reqwest::header::ACCEPT, "text/event-stream")
-        .header(reqwest::header::USER_AGENT, USER_AGENT)
+        .headers(metadata.identity_headers.clone())
         .body(body)
 }
 
@@ -498,8 +501,7 @@ fn codex_request(
                 "application/json"
             },
         )
-        .header("originator", device::ORIGINATOR)
-        .header(reqwest::header::USER_AGENT, USER_AGENT)
+        .headers(metadata.identity_headers.clone())
         .body(body);
     if metadata.operation != Operation::Responses {
         return request;
@@ -524,6 +526,7 @@ fn codex_request(
 fn copilot_request(
     client: &reqwest::Client,
     body: &[u8],
+    metadata: &RequestMetadata,
     endpoint: &str,
     access_token: &str,
 ) -> reqwest::RequestBuilder {
@@ -532,7 +535,7 @@ fn copilot_request(
         .bearer_auth(access_token)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .header(reqwest::header::ACCEPT, "text/event-stream")
-        .header(reqwest::header::USER_AGENT, USER_AGENT)
+        .headers(metadata.identity_headers.clone())
         .header("X-GitHub-Api-Version", copilot::API_VERSION)
         .body(body.to_vec())
 }
@@ -612,7 +615,7 @@ pub(crate) fn upstream_error_response(
     let bytes = serde_json::to_vec(&ApiError {
         error: ApiErrorBody {
             message,
-            r#type: "c2a_error",
+            r#type: "proxy_error",
             request_id,
         },
     })?;
@@ -642,20 +645,101 @@ mod tests {
         Operation, RequestMetadata, accepts_content_type, chatgpt_request, codex_request,
         copilot_request, upstream_error_detail, upstream_error_response,
     };
-    use crate::{claims::Claims, copilot, device, provider::USER_AGENT, storage::CodexCredentials};
+    use crate::{claims::Claims, copilot, device, storage::CodexCredentials};
+
+    fn metadata() -> RequestMetadata {
+        RequestMetadata {
+            operation: Operation::Responses,
+            model: "m".into(),
+            prompt_cache_key: None,
+            service_tier: None,
+            identity_headers: Default::default(),
+        }
+    }
+
+    #[test]
+    fn identity_headers_are_forwarded_only_when_supplied() {
+        let client = reqwest::Client::new();
+        let credentials = CodexCredentials {
+            version: 1,
+            access_token: "access".into(),
+            refresh_token: "refresh".into(),
+        };
+        let claims = Claims {
+            account_id: "account".into(),
+            ..Claims::default()
+        };
+        for (user_agent, originator) in [
+            (None, None),
+            (Some("mu/1.0"), None),
+            (None, Some("mu")),
+            (Some("mu/1.0"), Some("mu")),
+        ] {
+            let mut metadata = metadata();
+            for (name, value) in [("user-agent", user_agent), ("originator", originator)] {
+                if let Some(value) = value {
+                    metadata
+                        .identity_headers
+                        .insert(name, value.parse().unwrap());
+                }
+            }
+            let mut requests = vec![
+                chatgpt_request(&client, "{}".into(), &metadata, "access"),
+                copilot_request(
+                    &client,
+                    b"{}",
+                    &metadata,
+                    "https://api.githubcopilot.com",
+                    "access",
+                ),
+            ];
+            for operation in [
+                Operation::Responses,
+                Operation::ImageGenerations,
+                Operation::ImageEdits,
+            ] {
+                metadata.operation = operation;
+                requests.push(codex_request(
+                    &client,
+                    "{}".into(),
+                    &metadata,
+                    &credentials,
+                    &claims,
+                ));
+            }
+            for request in requests {
+                let request = request.build().unwrap();
+                for (name, expected) in [("user-agent", user_agent), ("originator", originator)] {
+                    assert_eq!(
+                        request
+                            .headers()
+                            .get(name)
+                            .map(|value| value.to_str().unwrap()),
+                        expected
+                    );
+                }
+                assert_eq!(request.headers()["authorization"], "Bearer access");
+            }
+        }
+    }
 
     #[test]
     fn chatgpt_request_preserves_native_bytes_without_codex_headers() {
         let bytes = hyper::body::Bytes::from_static(
             br#"{ "model":"m", "stream":true, "store":false, "input":[] }"#,
         );
-        let request = chatgpt_request(&reqwest::Client::new(), bytes.clone(), "access")
-            .build()
-            .unwrap();
+        let request = chatgpt_request(
+            &reqwest::Client::new(),
+            bytes.clone(),
+            &metadata(),
+            "access",
+        )
+        .build()
+        .unwrap();
         assert_eq!(request.url().as_str(), crate::chatgpt::UPSTREAM);
         assert_eq!(request.body().unwrap().as_bytes().unwrap(), bytes);
         assert_eq!(request.headers()["authorization"], "Bearer access");
-        assert_eq!(request.headers()["user-agent"], USER_AGENT);
+        assert!(request.headers().get("user-agent").is_none());
         for name in [
             "originator",
             "chatgpt-account-id",
@@ -680,6 +764,7 @@ mod tests {
                     model: "gpt-image-2.5-flare".into(),
                     prompt_cache_key: Some("unused".into()),
                     service_tier: Some("unused".into()),
+                    identity_headers: Default::default(),
                 },
                 &CodexCredentials {
                     version: 1,
@@ -701,8 +786,8 @@ mod tests {
             );
             assert_eq!(request.headers()["authorization"], "Bearer access");
             assert_eq!(request.headers()["chatgpt-account-id"], "account");
-            assert_eq!(request.headers()["originator"], "c2a");
-            assert_eq!(request.headers()["user-agent"], USER_AGENT);
+            assert!(request.headers().get("originator").is_none());
+            assert!(request.headers().get("user-agent").is_none());
             for name in [
                 device::SESSION_ID_HEADER,
                 device::ROUTING_HINT_HEADER,
@@ -715,7 +800,7 @@ mod tests {
     }
 
     #[test]
-    fn upstream_request_uses_honest_identity() {
+    fn upstream_request_uses_body_derived_routing_headers() {
         let request = codex_request(
             &reqwest::Client::new(),
             hyper::body::Bytes::from_static(br#"{"model":"gpt-5.6-luna","stream":true,"prompt_cache_key":"session-1","service_tier":"priority"}"#),
@@ -724,6 +809,7 @@ mod tests {
                 model: "gpt-5.6-luna".into(),
                 prompt_cache_key: Some("session-1".into()),
                 service_tier: Some("priority".into()),
+                identity_headers: Default::default(),
             },
             &CodexCredentials {
                 version: 1,
@@ -738,8 +824,8 @@ mod tests {
         .build()
         .unwrap();
 
-        assert_eq!(request.headers()["originator"], device::ORIGINATOR);
-        assert_eq!(request.headers()[reqwest::header::USER_AGENT], USER_AGENT);
+        assert!(request.headers().get("originator").is_none());
+        assert!(request.headers().get("user-agent").is_none());
         assert_eq!(request.headers()[device::SESSION_ID_HEADER], "session-1");
         assert_eq!(
             request.headers()[device::ROUTING_HINT_HEADER],
@@ -766,6 +852,7 @@ mod tests {
                 model: "gpt-5".into(),
                 prompt_cache_key: Some("bad\nkey".into()),
                 service_tier: None,
+                identity_headers: Default::default(),
             },
             &CodexCredentials {
                 version: 1,
@@ -788,10 +875,11 @@ mod tests {
     }
 
     #[test]
-    fn copilot_request_uses_c2a_identity_and_versioned_api() {
+    fn copilot_request_uses_versioned_api_without_default_identity() {
         let request = copilot_request(
             &reqwest::Client::new(),
             br#"{"model":"gpt-5.6-luna","stream":true}"#,
+            &metadata(),
             "https://api.individual.githubcopilot.com",
             "access",
         )
@@ -802,7 +890,7 @@ mod tests {
             request.url().as_str(),
             "https://api.individual.githubcopilot.com/responses"
         );
-        assert_eq!(request.headers()[reqwest::header::USER_AGENT], USER_AGENT);
+        assert!(request.headers().get("user-agent").is_none());
         assert_eq!(
             request.headers()["X-GitHub-Api-Version"],
             copilot::API_VERSION
@@ -835,8 +923,10 @@ mod tests {
         assert_eq!(upstream_error_detail(br#"{"unknown":true}"#), None);
     }
 
-    #[test]
-    fn upstream_error_preserves_status_and_retry_headers() {
+    #[tokio::test]
+    async fn upstream_error_preserves_status_and_retry_headers() {
+        use http_body_util::BodyExt;
+
         let retry_after = reqwest::header::HeaderValue::from_static("120");
         let response = upstream_error_response(
             429,
@@ -850,6 +940,9 @@ mod tests {
         assert_eq!(response.status(), hyper::StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(response.headers()[hyper::header::RETRY_AFTER], "120");
         assert_eq!(response.headers()["x-request-id"], "upstream-request");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "proxy_error");
     }
 
     #[test]

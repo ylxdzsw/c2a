@@ -14,8 +14,8 @@ use crate::{
 };
 
 // GitHub currently gates Copilot model capability by OAuth application. Borrow
-// OpenCode's public client ID only for authorization; every API request still
-// identifies this integration with c2a's own User-Agent.
+// OpenCode's public client ID only for authorization. Relayed requests forward
+// downstream User-Agent and originator headers without defaults.
 pub const CLIENT_ID: &str = "Ov23li8tweQw6odWQebz";
 pub const API_VERSION: &str = "2026-06-01";
 

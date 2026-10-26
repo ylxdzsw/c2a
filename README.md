@@ -21,7 +21,8 @@ install -Dm755 target/release/c2a /usr/bin/c2a
 
 Codex and Copilot use device login. ChatGPT uses browser OAuth with PKCE and a
 temporary loopback callback, with a pasted-URL fallback for remote browsers.
-All providers identify upstream as `c2a`. Compatibility details may change.
+Relayed requests use downstream application identity headers when supplied;
+authentication and discovery identify as `c2a`. Compatibility details may change.
 
 ## Login and status
 
@@ -198,8 +199,14 @@ For the system service:
 ```
 
 `c2a` does not translate models or request bodies. The configured model name and
-native Responses payload are forwarded unchanged. Local request headers are not
-forwarded. For Codex backend compatibility, c2a derives `session-id` from the
+native Responses payload are forwarded unchanged. On all Responses and Images
+routes, downstream `User-Agent` and `originator` headers are forwarded unchanged
+when provided and omitted when absent; c2a adds no default application identity.
+No other local request headers are forwarded. Authentication, account selection,
+and provider-required headers remain controlled by c2a. This applies to relayed
+inference requests only: login, refresh, discovery, and status requests retain
+c2a's own identity, including ChatGPT's application registration.
+For Codex backend compatibility, c2a derives `session-id` from the
 body's `prompt_cache_key` and derives `x-codex-routing-hint` from `model` and an
 optional `service_tier`.
 
