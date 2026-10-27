@@ -12,10 +12,10 @@ use hyper::{
     body::Bytes,
     header::{CONTENT_TYPE, HeaderName, HeaderValue, RETRY_AFTER},
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
 
 use crate::{
-    audit::{self, Audit, AuditRecord},
+    audit::{Audit, AuditRecord, RequestAudit},
     chatgpt,
     claims::Claims,
     copilot, device,
@@ -120,219 +120,151 @@ impl Relay {
         self.provider
     }
 
+    pub fn audit_request(&self, request_id: String) -> RequestAudit {
+        RequestAudit::new(self.audit.clone(), self.provider.as_str(), request_id)
+    }
+
     pub async fn start(
         self: &Arc<Self>,
         body: Bytes,
         metadata: RequestMetadata,
-        request_id: String,
+        mut audit: RequestAudit,
         permits: Vec<OwnedSemaphorePermit>,
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<Response<Body>> {
-        let started_at = audit::timestamp();
-        let request_bytes = body.len() as u64;
+        audit.begin_relay();
+        audit.record.operation = metadata.operation.as_str().into();
+        audit.record.model = metadata.model.clone();
+        audit.record.request_bytes = body.len() as u64;
+        audit.record.requested_service_tier = metadata.service_tier.clone();
+        let relay = self.clone();
         if metadata.operation != Operation::Responses {
-            let record = AuditRecord {
-                provider: self.provider.as_str().into(),
-                operation: metadata.operation.as_str().into(),
-                request_id,
-                started_at,
-                model: metadata.model.clone(),
-                request_bytes,
-                outcome: "failed".into(),
-                ..AuditRecord::default()
-            };
-            let relay = self.clone();
-            return images::start(self.audit.clone(), record, permits, shutdown, async move {
-                relay.send_authenticated(&body, &metadata).await
+            return images::start(audit, permits, shutdown, move |record| {
+                Box::pin(async move { relay.send_authenticated(&body, &metadata, record).await })
             })
             .await;
         }
-        let mut response = self.send_authenticated(&body, &metadata).await?;
+        let (mut reply, receive) = oneshot::channel();
+        tokio::spawn(async move {
+            let _permits = permits;
+            let result = {
+                let work = relay.responses(&body, &metadata, &mut audit);
+                if *shutdown.borrow() {
+                    Err("shutdown")
+                } else {
+                    tokio::select! {
+                        biased;
+                        _ = shutdown.changed() => Err("shutdown"),
+                        _ = reply.closed() => Err("client_disconnect"),
+                        result = work => Ok(result),
+                    }
+                }
+            };
+            match result {
+                Ok(Ok((response, stream))) => {
+                    audit.record.local_http_status = Some(response.status().as_u16());
+                    if reply.send(Ok(response)).is_err() {
+                        audit.record.local_http_status = None;
+                        audit.record.outcome = "client_disconnect".into();
+                    } else if let Some((mut upstream, mut sender)) = stream {
+                        observe_stream(&mut upstream, &mut sender, &mut audit, &mut shutdown).await;
+                    }
+                }
+                Ok(Err(error)) => {
+                    audit.record.local_http_status = Some(502);
+                    if reply.send(Err(error)).is_err() {
+                        audit.record.local_http_status = None;
+                        audit.record.outcome = "client_disconnect".into();
+                    }
+                }
+                Err(outcome) => {
+                    audit.record.outcome = outcome.into();
+                    if reply
+                        .send(Err(Error::message(format!("request ended: {outcome}"))))
+                        .is_ok()
+                    {
+                        audit.record.local_http_status = Some(502);
+                    }
+                }
+            }
+            audit.finish().await;
+        });
+        receive
+            .await
+            .map_err(|_| Error::message("relay task stopped"))?
+    }
 
-        let RequestMetadata { model, .. } = metadata;
-
+    async fn responses(
+        &self,
+        body: &Bytes,
+        metadata: &RequestMetadata,
+        audit: &mut RequestAudit,
+    ) -> Result<(Response<Body>, Option<UpstreamStream>)> {
+        let mut response = self
+            .send_authenticated(body, metadata, &mut audit.record)
+            .await?;
         let status = response.status();
-        let upstream_status = status.as_u16();
-        let upstream_request_id = sanitize_request_id(
-            response
-                .headers()
-                .get("x-request-id")
-                .or_else(|| response.headers().get("x-oai-request-id"))
-                .and_then(|value| value.to_str().ok()),
-        );
+        let upstream_request_id = audit.record.upstream_request_id.clone();
         if !status.is_success() {
+            audit.record.outcome = "upstream_error".into();
             let retry_after = response
                 .headers()
                 .get(reqwest::header::RETRY_AFTER)
                 .cloned();
-            let error_body = limited(&mut response, ERROR_LIMIT).await?;
-            let response_bytes = error_body.len() as u64;
-            self.record(AuditRecord {
-                provider: self.provider.as_str().into(),
-                operation: Operation::Responses.as_str().into(),
-                request_id: request_id.clone(),
-                started_at,
-                finished_at: audit::timestamp(),
-                model,
-                request_bytes,
-                response_bytes,
-                upstream_http_status: Some(upstream_status),
-                upstream_request_id: upstream_request_id.clone(),
-                upstream_imagegen_request_id: None,
-                response_id: None,
-                outcome: "upstream_error".into(),
-                response_model: None,
-                input_tokens: None,
-                output_tokens: None,
-            })
-            .await;
+            let error_body = limited_observed(&mut response, ERROR_LIMIT, audit).await?;
             if self.provider == Provider::Chatgpt {
-                let mut builder = Response::builder().status(upstream_status);
+                let mut builder = Response::builder().status(status.as_u16());
                 if let Some(value) = response.headers().get(reqwest::header::CONTENT_TYPE) {
                     builder = builder.header(CONTENT_TYPE, value.as_bytes());
                 }
                 if let Some(value) = retry_after {
-                    builder = builder.header(RETRY_AFTER, value.as_bytes());
+                    builder = builder.header(RETRY_AFTER, value);
                 }
                 if let Some(value) = upstream_request_id {
                     builder = builder.header("x-request-id", value);
                 }
                 return builder
                     .body(full(error_body))
+                    .map(|response| (response, None))
                     .map_err(|error| Error::message(error.to_string()));
             }
             let detail = upstream_error_detail(&error_body)
                 .map(|detail| format!(": {detail}"))
                 .unwrap_or_default();
-            let message = format!("upstream returned {upstream_status}{detail}");
+            let message = format!("upstream returned {}{detail}", status.as_u16());
             return upstream_error_response(
-                upstream_status,
+                status.as_u16(),
                 &message,
-                &request_id,
+                &audit.record.request_id,
                 retry_after.as_ref(),
                 upstream_request_id.as_deref(),
-            );
+            )
+            .map(|response| (response, None));
         }
-
         let content_type = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .cloned();
         if !accepts_content_type(content_type.as_ref()) {
-            let response_bytes = limited(&mut response, ERROR_LIMIT).await?.len() as u64;
-            self.record(AuditRecord {
-                provider: self.provider.as_str().into(),
-                operation: Operation::Responses.as_str().into(),
-                request_id,
-                started_at,
-                finished_at: audit::timestamp(),
-                model,
-                request_bytes,
-                response_bytes,
-                upstream_http_status: Some(upstream_status),
-                upstream_request_id,
-                upstream_imagegen_request_id: None,
-                response_id: None,
-                outcome: "upstream_error".into(),
-                response_model: None,
-                input_tokens: None,
-                output_tokens: None,
-            })
-            .await;
+            audit.record.outcome = "upstream_error".into();
+            limited_observed(&mut response, ERROR_LIMIT, audit).await?;
             return Err(Error::message("upstream did not return text/event-stream"));
         }
-        // The Codex backend can stream SSE without a Content-Type header.
         let content_type = content_type
             .unwrap_or_else(|| reqwest::header::HeaderValue::from_static("text/event-stream"));
-        let cache_control = response
-            .headers()
-            .get(reqwest::header::CACHE_CONTROL)
-            .cloned();
-        let (mut sender, body_channel) = Channel::<Bytes, Infallible>::new(4);
-        let audit = self.audit.clone();
-        let provider = self.provider;
-        let upstream_request_id_task = upstream_request_id.clone();
-        tokio::spawn(async move {
-            let _permits = permits;
-            let mut observer = crate::sse::Observer::new();
-            let mut response_bytes = 0u64;
-            let mut outcome = None;
-            loop {
-                match next_or_shutdown(&mut response, &mut shutdown).await {
-                    Next::Shutdown => {
-                        outcome = Some("shutdown".to_string());
-                        break;
-                    }
-                    Next::Chunk(Ok(Some(chunk))) => {
-                        response_bytes += chunk.len() as u64;
-                        observer.feed(&chunk);
-                        if sender.send_data(chunk).await.is_err() {
-                            outcome = Some("client_disconnect".to_string());
-                            break;
-                        }
-                    }
-                    Next::Chunk(Err(_)) | Next::Idle => {
-                        outcome = Some("premature_eof".to_string());
-                        break;
-                    }
-                    Next::Chunk(Ok(None)) => {
-                        observer.finish();
-                        break;
-                    }
-                }
-            }
-            let observation = &observer.observation;
-            let final_outcome = if observer.failed() {
-                "uninspected".into()
-            } else {
-                outcome.unwrap_or_else(|| {
-                    if let Some(value) = &observation.outcome {
-                        value.clone()
-                    } else {
-                        "premature_eof".into()
-                    }
-                })
-            };
-            let record = AuditRecord {
-                provider: provider.as_str().into(),
-                operation: Operation::Responses.as_str().into(),
-                request_id,
-                started_at,
-                finished_at: audit::timestamp(),
-                model,
-                request_bytes,
-                response_bytes,
-                upstream_http_status: Some(upstream_status),
-                upstream_request_id: upstream_request_id_task,
-                upstream_imagegen_request_id: None,
-                response_id: observation.response_id.clone(),
-                response_model: observation.response_model.clone(),
-                outcome: final_outcome,
-                input_tokens: observation.input_tokens,
-                output_tokens: observation.output_tokens,
-            };
-            if let Err(error) = audit::append(&audit, &record).await {
-                eprintln!("c2a: audit append failed: {error}");
-            }
-        });
-
-        let mut builder = Response::builder().status(
-            StatusCode::from_u16(upstream_status)
-                .map_err(|error| Error::message(error.to_string()))?,
-        );
-        if let Ok(value) = HeaderValue::from_bytes(content_type.as_bytes()) {
-            builder = builder.header(hyper::header::CONTENT_TYPE, value);
-        }
-        if let Some(value) =
-            cache_control.and_then(|value| HeaderValue::from_bytes(value.as_bytes()).ok())
-        {
+        let mut builder = Response::builder()
+            .status(status.as_u16())
+            .header(CONTENT_TYPE, content_type);
+        if let Some(value) = response.headers().get(reqwest::header::CACHE_CONTROL) {
             builder = builder.header(hyper::header::CACHE_CONTROL, value);
         }
         if let Some(value) = upstream_request_id {
-            builder = builder.header(HeaderName::from_static("x-request-id"), value);
+            builder = builder.header("x-request-id", value);
         }
+        let (sender, channel) = Channel::<Bytes, Infallible>::new(4);
         builder
-            .body(body_channel.boxed())
+            .body(channel.boxed())
+            .map(|local| (local, Some((response, sender))))
             .map_err(|error| Error::message(error.to_string()))
     }
 
@@ -340,18 +272,22 @@ impl Relay {
         &self,
         body: &Bytes,
         metadata: &RequestMetadata,
+        record: &mut AuditRecord,
     ) -> Result<reqwest::Response> {
-        let mut sent = self.send(body, metadata, None).await?;
+        let mut sent = self.send(body, metadata, None, record).await?;
+        record_upstream(&sent.response, record);
         // SIWC admission 401s can indicate permissions, not an expired token.
         // Refresh proactively; preserve direct-route authorization failures.
         if self.provider != Provider::Chatgpt
             && sent.response.status() == reqwest::StatusCode::UNAUTHORIZED
         {
+            record.auth_retries = Some(record.auth_retries.unwrap_or_default() + 1);
             let rejected_access_token = sent.access_token;
             drop(sent.response);
             sent = self
-                .send(body, metadata, Some(&rejected_access_token))
+                .send(body, metadata, Some(&rejected_access_token), record)
                 .await?;
+            record_upstream(&sent.response, record);
         }
         Ok(sent.response)
     }
@@ -361,6 +297,7 @@ impl Relay {
         body: &Bytes,
         metadata: &RequestMetadata,
         rejected_access_token: Option<&str>,
+        record: &mut AuditRecord,
     ) -> Result<Sent> {
         match self.provider {
             Provider::Chatgpt => {
@@ -369,10 +306,11 @@ impl Relay {
                     chatgpt::credentials(&self.client, &self.paths, rejected_access_token).await?;
                 let access_token = credentials.access_token;
                 drop(_guard);
+                let request =
+                    chatgpt_request(&self.client, body.clone(), metadata, &access_token).build()?;
+                record.upstream_attempts = Some(record.upstream_attempts.unwrap_or_default() + 1);
                 Ok(Sent {
-                    response: chatgpt_request(&self.client, body.clone(), metadata, &access_token)
-                        .send()
-                        .await?,
+                    response: self.client.execute(request).await?,
                     access_token,
                 })
             }
@@ -385,6 +323,7 @@ impl Relay {
                     codex_request(&self.client, body.clone(), metadata, &credentials, &claims)
                         .build()?;
                 drop(_guard);
+                record.upstream_attempts = Some(record.upstream_attempts.unwrap_or_default() + 1);
                 Ok(Sent {
                     response: self.client.execute(request).await?,
                     access_token,
@@ -397,16 +336,17 @@ impl Relay {
                 let access_token = credentials.access_token.clone();
                 drop(_guard);
                 let endpoint = self.copilot_endpoint(&credentials.access_token).await?;
+                let request = copilot_request(
+                    &self.client,
+                    body,
+                    metadata,
+                    &endpoint,
+                    &credentials.access_token,
+                )
+                .build()?;
+                record.upstream_attempts = Some(record.upstream_attempts.unwrap_or_default() + 1);
                 Ok(Sent {
-                    response: copilot_request(
-                        &self.client,
-                        body,
-                        metadata,
-                        &endpoint,
-                        &credentials.access_token,
-                    )
-                    .send()
-                    .await?,
+                    response: self.client.execute(request).await?,
                     access_token,
                 })
             }
@@ -429,12 +369,105 @@ impl Relay {
         });
         Ok(endpoint)
     }
+}
 
-    async fn record(&self, record: AuditRecord) {
-        if let Err(error) = audit::append(&self.audit, &record).await {
-            eprintln!("c2a: audit append failed: {error}");
+type UpstreamStream = (reqwest::Response, http_body_util::channel::Sender<Bytes>);
+
+fn record_upstream(response: &reqwest::Response, record: &mut AuditRecord) {
+    record.upstream_http_status = Some(response.status().as_u16());
+    record.upstream_request_id = sanitize_request_id(
+        response
+            .headers()
+            .get("x-request-id")
+            .or_else(|| response.headers().get("x-oai-request-id"))
+            .and_then(|value| value.to_str().ok()),
+    );
+}
+
+async fn observe_stream(
+    response: &mut reqwest::Response,
+    sender: &mut http_body_util::channel::Sender<Bytes>,
+    audit: &mut RequestAudit,
+    shutdown: &mut watch::Receiver<bool>,
+) {
+    let mut observer = crate::sse::Observer::new();
+    let mut outcome = None;
+    loop {
+        match next_or_shutdown(response, shutdown).await {
+            Next::Shutdown => {
+                outcome = Some("shutdown".to_string());
+                break;
+            }
+            Next::Chunk(Ok(Some(chunk))) => {
+                let elapsed = audit.elapsed_ms();
+                if !chunk.is_empty() {
+                    audit.record.first_upstream_byte_ms.get_or_insert(elapsed);
+                }
+                audit.record.response_bytes += chunk.len() as u64;
+                observer.feed_at(&chunk, elapsed);
+                let sent = tokio::select! {
+                    biased;
+                    _ = shutdown.changed() => Err("shutdown"),
+                    result = sender.send_data(chunk) => result.map_err(|_| "client_disconnect"),
+                };
+                if let Err(reason) = sent {
+                    outcome = Some(reason.to_owned());
+                    break;
+                }
+            }
+            Next::Chunk(Err(_)) | Next::Idle => {
+                outcome = Some("premature_eof".to_string());
+                break;
+            }
+            Next::Chunk(Ok(None)) => {
+                observer.finish();
+                break;
+            }
         }
     }
+    let observation = &observer.observation;
+    audit.record.outcome = if observer.failed() {
+        "uninspected".into()
+    } else {
+        outcome
+            .or_else(|| observation.outcome.clone())
+            .unwrap_or_else(|| "premature_eof".into())
+    };
+    audit.record.response_id = observation.response_id.clone();
+    audit.record.response_model = observation.response_model.clone();
+    audit.record.response_service_tier = observation.response_service_tier.clone();
+    audit.record.input_tokens = observation.input_tokens;
+    audit.record.output_tokens = observation.output_tokens;
+    audit.record.cached_input_tokens = observation.cached_input_tokens;
+    audit.record.reasoning_output_tokens = observation.reasoning_output_tokens;
+    audit.record.total_tokens = observation.total_tokens;
+    audit.record.first_output_ms = observation.first_output_ms;
+    audit.record.first_text_ms = observation.first_text_ms;
+    audit.record.last_output_ms = observation.last_output_ms;
+    audit.record.terminal_ms = observation.terminal_ms;
+    audit.record.first_output_kind = observation.first_output_kind.clone();
+}
+
+pub(crate) async fn limited_observed(
+    response: &mut reqwest::Response,
+    limit: usize,
+    audit: &mut RequestAudit,
+) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    while bytes.len() < limit {
+        let Some(chunk) = response.chunk().await? else {
+            break;
+        };
+        if !chunk.is_empty() {
+            let elapsed = audit.elapsed_ms();
+            audit.record.first_upstream_byte_ms.get_or_insert(elapsed);
+        }
+        let kept = chunk.len().min(limit - bytes.len());
+        // Retain the existing error-body count (bounded bytes, not full wire bytes).
+        audit.record.response_bytes += kept as u64;
+        bytes.extend_from_slice(&chunk[..kept]);
+    }
+    Ok(bytes)
 }
 
 enum Next {
@@ -550,17 +583,6 @@ fn copilot_request(
 
 fn valid_header_value(value: &str) -> Option<reqwest::header::HeaderValue> {
     reqwest::header::HeaderValue::try_from(value).ok()
-}
-
-pub(crate) async fn limited(response: &mut reqwest::Response, limit: usize) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    while bytes.len() < limit {
-        let Some(chunk) = response.chunk().await? else {
-            break;
-        };
-        bytes.extend_from_slice(&chunk[..chunk.len().min(limit - bytes.len())]);
-    }
-    Ok(bytes)
 }
 
 pub(crate) fn upstream_error_detail(bytes: &[u8]) -> Option<String> {
@@ -989,6 +1011,103 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["error"]["type"], "proxy_error");
+    }
+
+    fn test_audit() -> (std::path::PathBuf, crate::audit::RequestAudit) {
+        let mut random = [0u8; 8];
+        getrandom::fill(&mut random).unwrap();
+        let path =
+            std::env::temp_dir().join(format!("c2a-stream-audit-{}", u64::from_ne_bytes(random)));
+        let mut audit = crate::audit::RequestAudit::new(
+            crate::audit::open(&path).unwrap(),
+            "codex",
+            "local".into(),
+        );
+        audit.record.model = "requested-alias".into();
+        audit.begin_relay();
+        (path, audit)
+    }
+
+    #[tokio::test]
+    async fn stream_statistics_preserve_bytes_and_actual_response_metadata() {
+        use http_body_util::BodyExt;
+
+        let bytes = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"model\":\"served-model\",\"service_tier\":\"default\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"content-not-retained\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_test\",\"usage\":{\"input_tokens\":100,\"output_tokens\":20,\"total_tokens\":120,\"input_tokens_details\":{\"cached_tokens\":80},\"output_tokens_details\":{\"reasoning_tokens\":5}}}}\n\n",
+        ).as_bytes().to_vec();
+        let mut upstream: reqwest::Response = hyper::Response::new(bytes.clone()).into();
+        let (path, mut audit) = test_audit();
+        let (mut sender, body) = http_body_util::Channel::new(4);
+        let (_shutdown, mut receiver) = tokio::sync::watch::channel(false);
+        super::observe_stream(&mut upstream, &mut sender, &mut audit, &mut receiver).await;
+        drop(sender);
+        assert_eq!(body.collect().await.unwrap().to_bytes(), bytes);
+        audit.finish().await;
+        let line = std::fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["model"], "requested-alias");
+        assert_eq!(value["response_model"], "served-model");
+        assert_eq!(value["response_service_tier"], "default");
+        assert_eq!(value["cached_input_tokens"], 80);
+        assert_eq!(value["reasoning_output_tokens"], 5);
+        assert_eq!(value["total_tokens"], 120);
+        assert_eq!(value["outcome"], "completed");
+        assert_eq!(value["response_bytes"], bytes.len());
+        let times = [
+            "relay_start_ms",
+            "first_upstream_byte_ms",
+            "first_output_ms",
+            "last_output_ms",
+            "terminal_ms",
+            "duration_ms",
+        ]
+        .map(|field| value[field].as_f64().unwrap());
+        assert!(times.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(!line.contains("content-not-retained"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stream_disconnect_and_bounded_error_reads_retain_statistics() {
+        let (path, mut audit) = test_audit();
+        let mut response: reqwest::Response = hyper::Response::new(
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"x\"}\n\n".to_vec(),
+        )
+        .into();
+        let (mut sender, body) = http_body_util::Channel::new(4);
+        drop(body);
+        let (_shutdown, mut receiver) = tokio::sync::watch::channel(false);
+        super::observe_stream(&mut response, &mut sender, &mut audit, &mut receiver).await;
+        assert_eq!(audit.record.outcome, "client_disconnect");
+        assert!(audit.record.first_output_ms.is_some());
+        assert!(audit.record.terminal_ms.is_none());
+        audit.finish().await;
+        std::fs::remove_file(path).unwrap();
+
+        let (path, mut audit) = test_audit();
+        let mut response: reqwest::Response = hyper::Response::builder()
+            .status(429)
+            .header("x-request-id", "upstream-id")
+            .body(b"error detail".to_vec())
+            .unwrap()
+            .into();
+        super::record_upstream(&response, &mut audit.record);
+        let bytes = super::limited_observed(&mut response, 5, &mut audit)
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"error");
+        assert_eq!(audit.record.response_bytes, 5);
+        assert_eq!(audit.record.upstream_http_status, Some(429));
+        assert_eq!(
+            audit.record.upstream_request_id.as_deref(),
+            Some("upstream-id")
+        );
+        assert!(audit.record.first_upstream_byte_ms.is_some());
+        assert!(audit.record.first_output_ms.is_none());
+        audit.finish().await;
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

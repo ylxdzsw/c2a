@@ -1,7 +1,7 @@
 use std::{
     borrow::Cow,
     future::{Future, pending, poll_fn},
-    pin::pin,
+    pin::{Pin, pin},
     task::Poll,
     time::Duration,
 };
@@ -14,12 +14,12 @@ use hyper::{
 };
 use serde::{
     Deserialize, Deserializer,
-    de::{self, MapAccess, SeqAccess, Visitor},
+    de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor},
 };
 use tokio::sync::{OwnedSemaphorePermit, oneshot, watch};
 
 use crate::{
-    audit::{self, Audit, AuditRecord},
+    audit::{AuditRecord, RequestAudit},
     error::{Error, Result},
     relay::{self, Body, Operation, RequestMetadata},
 };
@@ -156,6 +156,10 @@ pub fn validate(
 struct ImageResponse {
     data: Count<Object<ImageData>, { usize::MAX }>,
     usage: Option<Usage>,
+    #[serde(default)]
+    model: ObservedString,
+    #[serde(default)]
+    service_tier: ObservedString,
 }
 
 #[derive(Deserialize)]
@@ -168,6 +172,166 @@ struct ImageData {
 struct Usage {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
+    #[serde(default)]
+    input_tokens_details: UsageDetails,
+    #[serde(default)]
+    output_tokens_details: UsageDetails,
+    #[serde(default)]
+    total_tokens: ObservedU64,
+}
+
+#[derive(Default)]
+struct ObservedString(Option<String>);
+
+macro_rules! ignore_simple_values {
+    ($value:expr) => {
+        fn visit_bool<E: de::Error>(self, _: bool) -> std::result::Result<Self::Value, E> {
+            Ok($value)
+        }
+        fn visit_f64<E: de::Error>(self, _: f64) -> std::result::Result<Self::Value, E> {
+            Ok($value)
+        }
+        fn visit_unit<E: de::Error>(self) -> std::result::Result<Self::Value, E> {
+            Ok($value)
+        }
+        fn visit_seq<A: SeqAccess<'de>>(
+            self,
+            mut sequence: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            while sequence.next_element::<IgnoredAny>()?.is_some() {}
+            Ok($value)
+        }
+    };
+}
+
+macro_rules! ignore_integer_values {
+    ($value:expr) => {
+        fn visit_i64<E: de::Error>(self, _: i64) -> std::result::Result<Self::Value, E> {
+            Ok($value)
+        }
+        fn visit_u64<E: de::Error>(self, _: u64) -> std::result::Result<Self::Value, E> {
+            Ok($value)
+        }
+    };
+}
+
+macro_rules! ignore_string_values {
+    ($value:expr) => {
+        fn visit_str<E: de::Error>(self, _: &str) -> std::result::Result<Self::Value, E> {
+            Ok($value)
+        }
+        fn visit_string<E: de::Error>(self, _: String) -> std::result::Result<Self::Value, E> {
+            Ok($value)
+        }
+    };
+}
+
+macro_rules! ignore_map_values {
+    ($value:expr) => {
+        fn visit_map<A: MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            while map.next_key::<IgnoredAny>()?.is_some() {
+                map.next_value::<IgnoredAny>()?;
+            }
+            Ok($value)
+        }
+    };
+}
+
+impl<'de> Deserialize<'de> for ObservedString {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct StringVisitor;
+        impl<'de> Visitor<'de> for StringVisitor {
+            type Value = ObservedString;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an optional nonempty string")
+            }
+            fn visit_str<E: de::Error>(self, value: &str) -> std::result::Result<Self::Value, E> {
+                Ok(ObservedString(
+                    (!value.is_empty()).then(|| value.to_owned()),
+                ))
+            }
+            fn visit_string<E: de::Error>(
+                self,
+                value: String,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(ObservedString((!value.is_empty()).then_some(value)))
+            }
+            ignore_integer_values!(ObservedString(None));
+            ignore_simple_values!(ObservedString(None));
+            ignore_map_values!(ObservedString(None));
+        }
+        deserializer.deserialize_any(StringVisitor)
+    }
+}
+
+#[derive(Default)]
+struct ObservedU64(Option<u64>);
+
+impl<'de> Deserialize<'de> for ObservedU64 {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct U64Visitor;
+        impl<'de> Visitor<'de> for U64Visitor {
+            type Value = ObservedU64;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an optional unsigned integer")
+            }
+            fn visit_u64<E: de::Error>(self, value: u64) -> std::result::Result<Self::Value, E> {
+                Ok(ObservedU64(Some(value)))
+            }
+            fn visit_i64<E: de::Error>(self, value: i64) -> std::result::Result<Self::Value, E> {
+                Ok(ObservedU64(u64::try_from(value).ok()))
+            }
+            ignore_string_values!(ObservedU64(None));
+            ignore_simple_values!(ObservedU64(None));
+            ignore_map_values!(ObservedU64(None));
+        }
+        deserializer.deserialize_any(U64Visitor)
+    }
+}
+
+#[derive(Default)]
+struct UsageDetails {
+    cached_tokens: Option<u64>,
+    reasoning_tokens: Option<u64>,
+}
+
+impl<'de> Deserialize<'de> for UsageDetails {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct DetailsVisitor;
+        impl<'de> Visitor<'de> for DetailsVisitor {
+            type Value = UsageDetails;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("optional usage details")
+            }
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut details = UsageDetails::default();
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "cached_tokens" => {
+                            details.cached_tokens = map.next_value::<ObservedU64>()?.0;
+                        }
+                        "reasoning_tokens" => {
+                            details.reasoning_tokens = map.next_value::<ObservedU64>()?.0;
+                        }
+                        _ => {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(details)
+            }
+            ignore_integer_values!(UsageDetails::default());
+            ignore_string_values!(UsageDetails::default());
+            ignore_simple_values!(UsageDetails::default());
+        }
+        deserializer.deserialize_any(DetailsVisitor)
+    }
 }
 
 fn observe(bytes: &[u8], record: &mut AuditRecord) -> Result<()> {
@@ -176,9 +340,14 @@ fn observe(bytes: &[u8], record: &mut AuditRecord) -> Result<()> {
     if response.data.0 == 0 {
         return Err(Error::message("upstream returned no image data"));
     }
+    record.response_model = response.model.0;
+    record.response_service_tier = response.service_tier.0;
     if let Some(usage) = response.usage {
         record.input_tokens = usage.input_tokens;
         record.output_tokens = usage.output_tokens;
+        record.cached_input_tokens = usage.input_tokens_details.cached_tokens;
+        record.reasoning_output_tokens = usage.output_tokens_details.reasoning_tokens;
+        record.total_tokens = usage.total_tokens.0;
     }
     Ok(())
 }
@@ -186,29 +355,35 @@ fn observe(bytes: &[u8], record: &mut AuditRecord) -> Result<()> {
 // The task owns admission permits and records cancellation even if Hyper drops
 // the service future while the non-streaming upstream request is still pending.
 pub async fn start(
-    audit: Audit,
-    mut record: AuditRecord,
+    mut audit: RequestAudit,
     permits: Vec<OwnedSemaphorePermit>,
     mut shutdown: watch::Receiver<bool>,
-    send: impl Future<Output = Result<reqwest::Response>> + Send + 'static,
+    send: impl for<'a> FnOnce(
+        &'a mut AuditRecord,
+    )
+        -> Pin<Box<dyn Future<Output = Result<reqwest::Response>> + Send + 'a>>
+    + Send
+    + 'static,
 ) -> Result<Response<Body>> {
     let (mut reply, receive) = oneshot::channel();
     tokio::spawn(async move {
         let _permits = permits;
         let work = async {
-            let response = send.await?;
-            read_response(response, &mut record, RESPONSE_LIMIT).await
+            let response = send(&mut audit.record).await?;
+            read_response(response, &mut audit, RESPONSE_LIMIT).await
         };
         let result = interrupt(work, &mut shutdown, reply.closed()).await;
         match result {
             Ok(Ok((mut response, bytes))) => {
+                let status = response.status().as_u16();
                 if let Some(bytes) = bytes {
                     let (mut sender, body) = Channel::new(1);
                     *response.body_mut() = body.boxed();
                     if reply.send(Ok(response)).is_err() {
-                        record.outcome = "client_disconnect".into();
+                        audit.record.outcome = "client_disconnect".into();
                     } else {
-                        record.outcome = "completed".into();
+                        audit.record.local_http_status = Some(status);
+                        audit.record.outcome = "completed".into();
                         for chunk in bytes.chunks(64 * 1024) {
                             // Copy small output chunks so queued data cannot retain the
                             // entire image allocation after admission is released.
@@ -221,34 +396,42 @@ pub async fn start(
                             {
                                 Ok(Ok(())) => {}
                                 Ok(Err(_)) => {
-                                    record.outcome = "client_disconnect".into();
+                                    audit.record.outcome = "client_disconnect".into();
                                     break;
                                 }
                                 Err(outcome) => {
-                                    record.outcome = outcome.into();
+                                    audit.record.outcome = outcome.into();
                                     break;
                                 }
                             }
                         }
                     }
                 } else if reply.send(Ok(response)).is_err() {
-                    record.outcome = "client_disconnect".into();
+                    audit.record.outcome = "client_disconnect".into();
+                } else {
+                    audit.record.local_http_status = Some(status);
                 }
             }
             Ok(Err(error)) => {
-                let _ = reply.send(Err(error));
+                if reply.send(Err(error)).is_ok() {
+                    audit.record.local_http_status = Some(502);
+                } else {
+                    audit.record.outcome = "client_disconnect".into();
+                }
             }
             Err(outcome) => {
-                record.outcome = outcome.into();
-                let _ = reply.send(Err(Error::message(format!(
-                    "image request ended: {outcome}"
-                ))));
+                audit.record.outcome = outcome.into();
+                if reply
+                    .send(Err(Error::message(format!(
+                        "image request ended: {outcome}"
+                    ))))
+                    .is_ok()
+                {
+                    audit.record.local_http_status = Some(502);
+                }
             }
         }
-        record.finished_at = audit::timestamp();
-        if let Err(error) = audit::append(&audit, &record).await {
-            eprintln!("c2a: audit append failed: {error}");
-        }
+        audit.finish().await;
     });
     receive
         .await
@@ -282,41 +465,40 @@ async fn interrupt<F: Future>(
 
 async fn read_response(
     mut response: reqwest::Response,
-    record: &mut AuditRecord,
+    audit: &mut RequestAudit,
     limit: usize,
 ) -> Result<(Response<Body>, Option<Bytes>)> {
     let status = response.status();
-    record.upstream_http_status = Some(status.as_u16());
-    record.upstream_request_id = relay::sanitize_request_id(
+    audit.record.upstream_http_status = Some(status.as_u16());
+    audit.record.upstream_request_id = relay::sanitize_request_id(
         response
             .headers()
             .get("x-request-id")
             .or_else(|| response.headers().get("x-oai-request-id"))
             .and_then(|value| value.to_str().ok()),
     );
-    record.upstream_imagegen_request_id = relay::sanitize_request_id(
+    audit.record.upstream_imagegen_request_id = relay::sanitize_request_id(
         response
             .headers()
             .get("x-codex-imagegen-request-id")
             .and_then(|value| value.to_str().ok()),
     );
-    record.outcome = "upstream_error".into();
+    audit.record.outcome = "upstream_error".into();
     if !status.is_success() {
         let retry_after = response
             .headers()
             .get(reqwest::header::RETRY_AFTER)
             .cloned();
-        let bytes = relay::limited(&mut response, relay::ERROR_LIMIT).await?;
-        record.response_bytes = bytes.len() as u64;
+        let bytes = relay::limited_observed(&mut response, relay::ERROR_LIMIT, audit).await?;
         let detail = relay::upstream_error_detail(&bytes)
             .map(|detail| format!(": {detail}"))
             .unwrap_or_default();
         let response = relay::upstream_error_response(
             status.as_u16(),
             &format!("upstream returned {}{detail}", status.as_u16()),
-            &record.request_id,
+            &audit.record.request_id,
             retry_after.as_ref(),
-            record.upstream_request_id.as_deref(),
+            audit.record.upstream_request_id.as_deref(),
         )?;
         return Ok((response, None));
     }
@@ -332,17 +514,21 @@ async fn read_response(
     }
     let cache_control = response.headers().get(CACHE_CONTROL).cloned();
     let mut bytes = Vec::new();
-    record.outcome = "premature_eof".into();
+    audit.record.outcome = "premature_eof".into();
     while let Some(chunk) = response.chunk().await? {
-        record.response_bytes += chunk.len() as u64;
+        audit.record.response_bytes += chunk.len() as u64;
+        if !chunk.is_empty() {
+            let elapsed = audit.elapsed_ms();
+            audit.record.first_upstream_byte_ms.get_or_insert(elapsed);
+        }
         if chunk.len() > limit - bytes.len() {
-            record.outcome = "uninspected".into();
+            audit.record.outcome = "uninspected".into();
             return Err(Error::message("upstream image response exceeds size limit"));
         }
         bytes.extend_from_slice(&chunk);
     }
-    record.outcome = "uninspected".into();
-    observe(&bytes, record)?;
+    audit.record.outcome = "uninspected".into();
+    observe(&bytes, &mut audit.record)?;
     let mut builder = Response::builder()
         .status(status)
         .header(CONTENT_TYPE, "application/json")
@@ -350,10 +536,10 @@ async fn read_response(
     if let Some(value) = cache_control {
         builder = builder.header(CACHE_CONTROL, value);
     }
-    if let Some(value) = &record.upstream_request_id {
+    if let Some(value) = &audit.record.upstream_request_id {
         builder = builder.header("x-request-id", value);
     }
-    if let Some(value) = &record.upstream_imagegen_request_id {
+    if let Some(value) = &audit.record.upstream_imagegen_request_id {
         builder = builder.header("x-codex-imagegen-request-id", value);
     }
     let response = builder
@@ -386,6 +572,15 @@ mod tests {
 
     fn image_bytes() -> Vec<u8> {
         format!(r#"{{ "data": [{{"b64_json":"{}", "generation_id":"not-a-response-id"}}], "usage":{{"input_tokens":3,"output_tokens":7}}, "future_field":true }}"#, "A".repeat(300 * 1024)).into_bytes()
+    }
+
+    fn test_request_audit() -> (RequestAudit, std::path::PathBuf) {
+        let mut random = [0u8; 8];
+        getrandom::fill(&mut random).unwrap();
+        let path =
+            std::env::temp_dir().join(format!("c2a-image-test-{}", u64::from_ne_bytes(random)));
+        let audit = crate::audit::open(&path).unwrap();
+        (RequestAudit::new(audit, "codex", "image-test".into()), path)
     }
 
     #[test]
@@ -425,8 +620,8 @@ mod tests {
     fn image_response_is_byte_preserving_bounded_and_metadata_only() {
         runtime().block_on(async {
             let bytes = image_bytes();
-            let mut record = AuditRecord::default();
-            let (response, body) = read_response(upstream(bytes.clone()), &mut record, bytes.len())
+            let (mut audit, path) = test_request_audit();
+            let (response, body) = read_response(upstream(bytes.clone()), &mut audit, bytes.len())
                 .await
                 .unwrap();
             assert_eq!(body.unwrap(), bytes);
@@ -436,12 +631,13 @@ mod tests {
                 response.headers()["x-codex-imagegen-request-id"],
                 "image-id"
             );
-            assert_eq!(record.response_bytes, bytes.len() as u64);
-            assert_eq!(record.input_tokens, Some(3));
-            assert_eq!(record.output_tokens, Some(7));
-            assert!(record.response_id.is_none());
+            assert_eq!(audit.record.response_bytes, bytes.len() as u64);
+            assert_eq!(audit.record.input_tokens, Some(3));
+            assert_eq!(audit.record.output_tokens, Some(7));
+            assert!(audit.record.first_upstream_byte_ms.is_some());
+            assert!(audit.record.response_id.is_none());
             assert!(
-                read_response(upstream(bytes.clone()), &mut record, bytes.len() - 1)
+                read_response(upstream(bytes.clone()), &mut audit, bytes.len() - 1)
                     .await
                     .is_err()
             );
@@ -452,11 +648,11 @@ mod tests {
                 b"{truncated",
             ] {
                 assert!(
-                    read_response(upstream(invalid.to_vec()), &mut record, 1024)
+                    read_response(upstream(invalid.to_vec()), &mut audit, 1024)
                         .await
                         .is_err()
                 );
-                assert_eq!(record.outcome, "uninspected");
+                assert_eq!(audit.record.outcome, "uninspected");
             }
             let wrong_type = Response::builder()
                 .header(CONTENT_TYPE, "text/event-stream")
@@ -464,7 +660,7 @@ mod tests {
                 .unwrap()
                 .into();
             assert!(
-                read_response(wrong_type, &mut record, RESPONSE_LIMIT)
+                read_response(wrong_type, &mut audit, RESPONSE_LIMIT)
                     .await
                     .is_err()
             );
@@ -474,14 +670,58 @@ mod tests {
                 .body(br#"{"error":{"message":"quota exceeded"}}"#.to_vec())
                 .unwrap()
                 .into();
-            let (response, body) = read_response(error, &mut record, RESPONSE_LIMIT)
+            let (response, body) = read_response(error, &mut audit, RESPONSE_LIMIT)
                 .await
                 .unwrap();
             assert_eq!(response.status(), 429);
             assert_eq!(response.headers()["retry-after"], "12");
             assert!(body.is_none());
-            assert_eq!(record.outcome, "upstream_error");
+            assert_eq!(audit.record.outcome, "upstream_error");
+            assert!(audit.record.first_upstream_byte_ms.is_some());
+            audit.finish().await;
+            fs::remove_file(path).unwrap();
         });
+    }
+
+    #[test]
+    fn image_response_observes_optional_model_tier_and_token_usage() {
+        let mut record = AuditRecord::default();
+        observe(
+            br#"{"data":[{"b64_json":"AA=="}],"model":"gpt-image-2.5","service_tier":"priority","usage":{"input_tokens":11,"output_tokens":13,"input_tokens_details":{"cached_tokens":3},"output_tokens_details":{"reasoning_tokens":5},"total_tokens":24}}"#,
+            &mut record,
+        )
+        .unwrap();
+        assert_eq!(record.response_model.as_deref(), Some("gpt-image-2.5"));
+        assert_eq!(record.response_service_tier.as_deref(), Some("priority"));
+        assert_eq!(record.input_tokens, Some(11));
+        assert_eq!(record.output_tokens, Some(13));
+        assert_eq!(record.cached_input_tokens, Some(3));
+        assert_eq!(record.reasoning_output_tokens, Some(5));
+        assert_eq!(record.total_tokens, Some(24));
+
+        let mut missing = AuditRecord::default();
+        observe(br#"{"data":[{"b64_json":"AA=="}]}"#, &mut missing).unwrap();
+        assert!(missing.response_model.is_none());
+        assert!(missing.response_service_tier.is_none());
+        assert!(missing.input_tokens.is_none());
+        assert!(missing.output_tokens.is_none());
+        assert!(missing.cached_input_tokens.is_none());
+        assert!(missing.reasoning_output_tokens.is_none());
+        assert!(missing.total_tokens.is_none());
+
+        let mut malformed_metadata = AuditRecord::default();
+        observe(
+            br#"{"data":[{"b64_json":"AA=="}],"model":{"unexpected":true},"service_tier":[],"usage":{"input_tokens":2,"output_tokens":4,"input_tokens_details":false,"output_tokens_details":[1],"total_tokens":{"unexpected":true}}}"#,
+            &mut malformed_metadata,
+        )
+        .unwrap();
+        assert!(malformed_metadata.response_model.is_none());
+        assert!(malformed_metadata.response_service_tier.is_none());
+        assert_eq!(malformed_metadata.input_tokens, Some(2));
+        assert_eq!(malformed_metadata.output_tokens, Some(4));
+        assert!(malformed_metadata.cached_input_tokens.is_none());
+        assert!(malformed_metadata.reasoning_output_tokens.is_none());
+        assert!(malformed_metadata.total_tokens.is_none());
     }
 
     #[test]
@@ -497,19 +737,20 @@ mod tests {
                 getrandom::fill(&mut random).unwrap();
                 let path = std::env::temp_dir()
                     .join(format!("c2a-image-test-{}", u64::from_ne_bytes(random)));
-                let audit = audit::open(&path).unwrap();
+                let audit_file = crate::audit::open(&path).unwrap();
                 let slots = Arc::new(Semaphore::new(1));
                 let permits = vec![slots.clone().try_acquire_owned().unwrap()];
                 let (shutdown, receiver) = watch::channel(false);
-                let record = AuditRecord {
-                    operation: "images.generations".into(),
-                    ..AuditRecord::default()
-                };
+                let mut audit = RequestAudit::new(audit_file, "codex", "image-test".into());
+                audit.record.operation = "images.generations".into();
                 if scenario == "cancel_before_headers" || scenario == "shutdown" {
                     let (entered, started) = oneshot::channel();
-                    let task = tokio::spawn(start(audit, record, permits, receiver, async {
-                        let _ = entered.send(());
-                        pending().await
+                    let task = tokio::spawn(start(audit, permits, receiver, move |record| {
+                        record.upstream_attempts = Some(1);
+                        Box::pin(async move {
+                            let _ = entered.send(());
+                            pending().await
+                        })
                     }));
                     started.await.unwrap();
                     if scenario == "shutdown" {
@@ -520,8 +761,9 @@ mod tests {
                         let _ = task.await;
                     }
                 } else {
-                    let response = start(audit, record, permits, receiver, async {
-                        Ok(upstream(image_bytes()))
+                    let response = start(audit, permits, receiver, |record| {
+                        record.upstream_attempts = Some(1);
+                        Box::pin(async { Ok(upstream(image_bytes())) })
                     })
                     .await
                     .unwrap();
@@ -547,6 +789,16 @@ mod tests {
                     scenario
                 };
                 assert_eq!(value["outcome"], expected);
+                assert_eq!(value["upstream_attempts"], 1);
+                let expected_status = match scenario {
+                    "completed" | "client_disconnect" => Some(200u16),
+                    "shutdown" => Some(502),
+                    _ => None,
+                };
+                assert_eq!(
+                    value["local_http_status"],
+                    expected_status.map_or(serde_json::Value::Null, serde_json::Value::from)
+                );
                 fs::remove_file(path).unwrap();
             }
         });

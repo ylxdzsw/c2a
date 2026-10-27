@@ -26,6 +26,7 @@ use tokio::{
 };
 
 use crate::{
+    audit::RequestAudit,
     error::{ApiError, ApiErrorBody, Error, Result},
     images,
     provider::Provider,
@@ -122,9 +123,37 @@ async fn handle(
     semaphore: Arc<Semaphore>,
     shutdown: watch::Receiver<bool>,
 ) -> std::result::Result<Response<Body>, Infallible> {
-    let response = handle_inner(request, relay, semaphore, shutdown)
-        .await
-        .unwrap_or_else(|error| json_error(StatusCode::BAD_GATEWAY, &error.to_string()));
+    let (request_id, id_error) = match random_id() {
+        Ok(request_id) => (request_id, None),
+        Err(error) => ("00000000000000000000000000000000".into(), Some(error)),
+    };
+    let mut audit = Some(relay.audit_request(request_id.clone()));
+    if let Some(audit) = audit.as_mut() {
+        audit.record.operation = "unknown".into();
+    }
+    let response = match id_error {
+        Some(error) => json_error_with_id(StatusCode::BAD_GATEWAY, &error.to_string(), &request_id),
+        None => {
+            match handle_inner(request, relay, semaphore, shutdown, &request_id, &mut audit).await {
+                Ok(response) => response,
+                Err(error) => {
+                    json_error_with_id(StatusCode::BAD_GATEWAY, &error.to_string(), &request_id)
+                }
+            }
+        }
+    };
+    if let Some(mut audit) = audit.take() {
+        let status = response.status();
+        audit.record.local_http_status = Some(status.as_u16());
+        audit.record.outcome =
+            if status.is_client_error() || status == StatusCode::SERVICE_UNAVAILABLE {
+                "rejected"
+            } else {
+                "failed"
+            }
+            .into();
+        audit.finish().await;
+    }
     Ok(response)
 }
 
@@ -133,20 +162,24 @@ async fn handle_inner(
     relay: Arc<Relay>,
     semaphore: Arc<Semaphore>,
     shutdown: watch::Receiver<bool>,
+    request_id: &str,
+    audit: &mut Option<RequestAudit>,
 ) -> Result<Response<Body>> {
-    let request_id = random_id()?;
     let Some(operation) = relay.operation(request.uri().path()) else {
         return Ok(json_error_with_id(
             StatusCode::NOT_FOUND,
             "not found",
-            &request_id,
+            request_id,
         ));
     };
+    if let Some(audit) = audit.as_mut() {
+        audit.record.operation = operation.as_str().into();
+    }
     if request.method() != Method::POST {
         let mut response = json_error_with_id(
             StatusCode::METHOD_NOT_ALLOWED,
             "method not allowed",
-            &request_id,
+            request_id,
         );
         response
             .headers_mut()
@@ -166,7 +199,7 @@ async fn handle_inner(
         return Ok(json_error_with_id(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "content type must be application/json",
-            &request_id,
+            request_id,
         ));
     }
     let mut permits = Vec::new();
@@ -179,7 +212,7 @@ async fn handle_inner(
                 return Ok(json_error_with_id(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "too many active relays",
-                    &request_id,
+                    request_id,
                 ));
             }
         }
@@ -193,7 +226,7 @@ async fn handle_inner(
         json_error_with_id(
             StatusCode::PAYLOAD_TOO_LARGE,
             &format!("request body exceeds {} MiB", limit / (1024 * 1024)),
-            &request_id,
+            request_id,
         )
     };
     if request
@@ -220,18 +253,22 @@ async fn handle_inner(
             return Ok(json_error_with_id(
                 StatusCode::REQUEST_TIMEOUT,
                 "request body timed out",
-                &request_id,
+                request_id,
             ));
         }
         Ok(Err(_)) => {
             return Ok(json_error_with_id(
                 StatusCode::BAD_REQUEST,
                 "request body could not be read",
-                &request_id,
+                request_id,
             ));
         }
     };
     let bytes = collected.to_bytes();
+    if let Some(audit) = audit.as_mut() {
+        // Record only the collected length; request payloads are never retained.
+        audit.record.request_bytes = bytes.len() as u64;
+    }
     let validation = if operation == Operation::Responses {
         validate_body(&bytes, relay.provider())
     } else {
@@ -243,20 +280,23 @@ async fn handle_inner(
             return Ok(json_error_with_id(
                 StatusCode::BAD_REQUEST,
                 message,
-                &request_id,
+                request_id,
             ));
         }
     };
+    if let Some(audit) = audit.as_mut() {
+        audit.record.model = metadata.model.clone();
+    }
     metadata.identity_headers = identity_headers;
-    match relay
-        .start(bytes, metadata, request_id.clone(), permits, shutdown)
-        .await
-    {
+    let audit = audit
+        .take()
+        .expect("request audit must exist before relay handoff");
+    match relay.start(bytes, metadata, audit, permits, shutdown).await {
         Ok(response) => Ok(response),
         Err(error) => Ok(json_error_with_id(
             StatusCode::BAD_GATEWAY,
             &error.to_string(),
-            &request_id,
+            request_id,
         )),
     }
 }
@@ -319,10 +359,6 @@ fn reap_finished(tasks: &mut JoinSet<()>) {
     }
 }
 
-fn json_error(status: StatusCode, message: &str) -> Response<Body> {
-    let id = random_id().unwrap_or_else(|_| "00000000000000000000000000000000".into());
-    json_error_with_id(status, message, &id)
-}
 fn json_error_with_id(status: StatusCode, message: &str, id: &str) -> Response<Body> {
     let bytes = serde_json::to_vec(&ApiError {
         error: ApiErrorBody {

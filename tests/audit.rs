@@ -44,8 +44,8 @@ fn sse_parses_across_every_byte_split() {
     let event = completed_event();
     for split in 0..=event.len() {
         let mut observer = audit::SseObserver::new();
-        observer.feed(&event[..split]);
-        observer.feed(&event[split..]);
+        observer.feed_at(&event[..split], 0.0);
+        observer.feed_at(&event[split..], 0.0);
         observer.finish();
         assert!(!observer.failed(), "split {split}");
         assert_eq!(
@@ -63,17 +63,108 @@ fn sse_parses_across_every_byte_split() {
 }
 
 #[test]
+fn sse_event_timing_uses_the_chunk_that_completes_it() {
+    let event = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n";
+    for split in 0..=event.len() {
+        let mut observer = audit::SseObserver::new();
+        observer.feed_at(&event[..split], 11.0);
+        observer.feed_at(&event[split..], 23.0);
+        observer.finish();
+        assert!(!observer.failed(), "split {split}");
+        let completed_at = if split == event.len() { 11.0 } else { 23.0 };
+        assert_eq!(observer.observation.first_output_ms, Some(completed_at));
+        assert_eq!(observer.observation.first_text_ms, Some(completed_at));
+        assert_eq!(observer.observation.last_output_ms, Some(completed_at));
+        assert_eq!(
+            observer.observation.first_output_kind.as_deref(),
+            Some("output_text")
+        );
+    }
+}
+
+#[test]
+fn lifecycle_and_empty_deltas_do_not_count_as_output() {
+    let mut observer = audit::SseObserver::new();
+    for event in [
+        serde_json::json!({"type": "response.created"}),
+        serde_json::json!({"type": "response.in_progress"}),
+        serde_json::json!({"type": "response.output_item.added"}),
+        serde_json::json!({"type": "response.output_text.done", "delta": "ignored"}),
+        serde_json::json!({"type": "response.output_text.delta", "delta": ""}),
+        serde_json::json!({"type": "response.unknown.delta", "delta": "ignored"}),
+    ] {
+        observer.feed_at(format!("data: {event}\n\n").as_bytes(), 3.0);
+    }
+    assert_eq!(observer.observation.first_output_ms, None);
+    assert_eq!(observer.observation.first_text_ms, None);
+    assert_eq!(observer.observation.last_output_ms, None);
+    assert_eq!(observer.observation.first_output_kind, None);
+
+    observer.feed_at(
+        b"data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{}\"}\n\n",
+        7.0,
+    );
+    observer.feed_at(
+        b"data: {\"type\":\"response.refusal.delta\",\"delta\":\"No\"}\n\n",
+        9.0,
+    );
+    observer.feed_at(b"data: {\"type\":\"response.completed\"}\n\n", 12.0);
+    observer.finish();
+    assert!(!observer.failed());
+    assert_eq!(observer.observation.first_output_ms, Some(7.0));
+    assert_eq!(observer.observation.first_text_ms, Some(9.0));
+    assert_eq!(observer.observation.last_output_ms, Some(9.0));
+    assert_eq!(observer.observation.terminal_ms, Some(12.0));
+    assert_eq!(
+        observer.observation.first_output_kind.as_deref(),
+        Some("function_call_arguments")
+    );
+}
+
+#[test]
+fn usage_updates_keep_prior_numbers_and_preserve_known_zeroes() {
+    let mut observer = audit::SseObserver::new();
+    observer.feed_at(
+        b"data: {\"type\":\"response.in_progress\",\"response\":{\"service_tier\":\"priority\",\"usage\":{\"input_tokens\":3,\"output_tokens\":4,\"total_tokens\":7,\"input_tokens_details\":{\"cached_tokens\":2},\"output_tokens_details\":{\"reasoning_tokens\":1}}}}\n\n", 0.0);
+    observer.feed_at(
+        b"data: {\"type\":\"response.in_progress\",\"response\":{\"service_tier\":null,\"usage\":{\"input_tokens\":null,\"output_tokens\":\"bad\",\"total_tokens\":null,\"input_tokens_details\":{\"cached_tokens\":null},\"output_tokens_details\":{\"reasoning_tokens\":-1}}}}\n\n", 0.0);
+    assert_eq!(observer.observation.input_tokens, Some(3));
+    assert_eq!(observer.observation.output_tokens, Some(4));
+    assert_eq!(observer.observation.cached_input_tokens, Some(2));
+    assert_eq!(observer.observation.reasoning_output_tokens, Some(1));
+    assert_eq!(observer.observation.total_tokens, Some(7));
+    assert_eq!(
+        observer.observation.response_service_tier.as_deref(),
+        Some("priority")
+    );
+
+    observer.feed_at(
+        b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens_details\":{\"reasoning_tokens\":0}}}}\n\n", 0.0);
+    observer.finish();
+    assert!(!observer.failed());
+    assert_eq!(observer.observation.input_tokens, Some(0));
+    assert_eq!(observer.observation.output_tokens, Some(0));
+    assert_eq!(observer.observation.cached_input_tokens, Some(0));
+    assert_eq!(observer.observation.reasoning_output_tokens, Some(0));
+    assert_eq!(observer.observation.total_tokens, Some(0));
+}
+
+#[test]
 fn sse_model_is_optional_and_retained_when_later_events_omit_it() {
     let mut observer = audit::SseObserver::new();
     for model in [serde_json::Value::Null, "".into(), 42.into()] {
         let event = serde_json::json!({"type": "response.created", "response": {"model": model}});
-        observer.feed(format!("data: {event}\n\n").as_bytes());
+        observer.feed_at(format!("data: {event}\n\n").as_bytes(), 0.0);
         assert!(observer.observation.response_model.is_none());
     }
-    observer.feed(
+    observer.feed_at(
         b"data: {\"type\":\"response.created\",\"response\":{\"model\":\"returned-model\"}}\n\n",
+        0.0,
     );
-    observer.feed(b"data: {\"type\":\"response.completed\",\"response\":{}}\n\n");
+    observer.feed_at(
+        b"data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+        0.0,
+    );
     observer.finish();
     assert!(!observer.failed());
     assert_eq!(
@@ -85,11 +176,11 @@ fn sse_model_is_optional_and_retained_when_later_events_omit_it() {
 #[test]
 fn malformed_or_oversized_events_become_uninspected() {
     let mut malformed = audit::SseObserver::new();
-    malformed.feed(b"data: {bad}\n\n");
+    malformed.feed_at(b"data: {bad}\n\n", 0.0);
     assert!(malformed.failed());
 
     let mut oversized = audit::SseObserver::new();
-    oversized.feed(&vec![b'x'; 256 * 1024 + 1]);
+    oversized.feed_at(&vec![b'x'; 256 * 1024 + 1], 0.0);
     assert!(oversized.failed());
 }
 
@@ -112,6 +203,7 @@ fn audit_serialization_omits_unavailable_and_secret_fields() {
         outcome: "completed".into(),
         input_tokens: None,
         output_tokens: None,
+        ..audit::AuditRecord::default()
     };
     let value = serde_json::to_value(record).unwrap();
     let object = value.as_object().unwrap();
@@ -119,6 +211,28 @@ fn audit_serialization_omits_unavailable_and_secret_fields() {
     assert!(!object.contains_key("response_id"));
     assert!(!object.contains_key("response_model"));
     assert!(!object.contains_key("input_tokens"));
+    for optional in [
+        "received_at",
+        "duration_ms",
+        "relay_start_ms",
+        "relay_duration_ms",
+        "first_upstream_byte_ms",
+        "first_output_ms",
+        "first_text_ms",
+        "last_output_ms",
+        "terminal_ms",
+        "first_output_kind",
+        "upstream_attempts",
+        "auth_retries",
+        "local_http_status",
+        "cached_input_tokens",
+        "reasoning_output_tokens",
+        "total_tokens",
+        "requested_service_tier",
+        "response_service_tier",
+    ] {
+        assert!(!object.contains_key(optional), "{optional}");
+    }
     assert_eq!(object["operation"], "responses");
     assert_eq!(object["upstream_http_status"], 200);
     assert!(!object.contains_key("upstream_imagegen_request_id"));
@@ -136,6 +250,159 @@ fn audit_serialization_omits_unavailable_and_secret_fields() {
     ] {
         assert!(!object.contains_key(forbidden));
     }
+}
+
+#[test]
+fn audit_serialization_includes_known_statistics() {
+    let record = audit::AuditRecord {
+        received_at: Some("received".into()),
+        duration_ms: Some(12.5),
+        relay_start_ms: Some(1.0),
+        relay_duration_ms: Some(11.5),
+        first_upstream_byte_ms: Some(2.0),
+        first_output_ms: Some(3.0),
+        first_text_ms: Some(4.0),
+        last_output_ms: Some(5.0),
+        terminal_ms: Some(6.0),
+        first_output_kind: Some("output_text".into()),
+        upstream_attempts: Some(2),
+        auth_retries: Some(1),
+        local_http_status: Some(200),
+        cached_input_tokens: Some(7),
+        reasoning_output_tokens: Some(8),
+        total_tokens: Some(9),
+        requested_service_tier: Some("auto".into()),
+        response_service_tier: Some("priority".into()),
+        ..audit::AuditRecord::default()
+    };
+    let value = serde_json::to_value(record).unwrap();
+    assert_eq!(value["received_at"], "received");
+    assert_eq!(value["duration_ms"], 12.5);
+    assert_eq!(value["relay_start_ms"], 1.0);
+    assert_eq!(value["relay_duration_ms"], 11.5);
+    assert_eq!(value["first_upstream_byte_ms"], 2.0);
+    assert_eq!(value["first_output_ms"], 3.0);
+    assert_eq!(value["first_text_ms"], 4.0);
+    assert_eq!(value["last_output_ms"], 5.0);
+    assert_eq!(value["terminal_ms"], 6.0);
+    assert_eq!(value["first_output_kind"], "output_text");
+    assert_eq!(value["upstream_attempts"], 2);
+    assert_eq!(value["auth_retries"], 1);
+    assert_eq!(value["local_http_status"], 200);
+    assert_eq!(value["cached_input_tokens"], 7);
+    assert_eq!(value["reasoning_output_tokens"], 8);
+    assert_eq!(value["total_tokens"], 9);
+    assert_eq!(value["requested_service_tier"], "auto");
+    assert_eq!(value["response_service_tier"], "priority");
+}
+
+#[test]
+fn request_audit_finalizes_and_appends_once() {
+    let root = temp_dir();
+    let path = root.join("audit.jsonl");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let audit = audit::open(&path).unwrap();
+        let mut request = audit::RequestAudit::new(audit, "codex", "request".into());
+        assert_eq!(request.record.outcome, "failed");
+        assert_eq!(request.record.upstream_attempts, Some(0));
+        assert_eq!(request.record.auth_retries, Some(0));
+        assert!(request.record.received_at.is_some());
+        request.begin_relay();
+        request.record.outcome = "completed".into();
+        request.finish().await;
+    });
+    let lines = fs::read_to_string(&path).unwrap();
+    assert_eq!(lines.lines().count(), 1);
+    let record: serde_json::Value = serde_json::from_str(lines.lines().next().unwrap()).unwrap();
+    assert_eq!(record["outcome"], "completed");
+    assert_eq!(record["provider"], "codex");
+    assert!(record["duration_ms"].as_f64().is_some());
+    assert!(record["relay_start_ms"].as_f64().is_some());
+    assert!(record["relay_duration_ms"].as_f64().is_some());
+    assert!(record["received_at"].as_str().is_some());
+    assert!(record["started_at"].as_str().is_some());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn dropped_request_audit_records_disconnect_or_shutdown() {
+    let root = temp_dir();
+    let path = root.join("audit.jsonl");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let audit = audit::open(&path).unwrap();
+        drop(audit::RequestAudit::new(
+            audit.clone(),
+            "codex",
+            "disconnect".into(),
+        ));
+        let mut shutdown = audit::RequestAudit::new(audit, "copilot", "shutdown".into());
+        shutdown.record.outcome = "shutdown".into();
+        drop(shutdown);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if fs::read_to_string(&path).unwrap().lines().count() == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    });
+    let mut outcomes = fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).unwrap()["outcome"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    outcomes.sort();
+    assert_eq!(outcomes, ["client_disconnect", "shutdown"]);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn cancelling_finalization_does_not_lose_a_record_waiting_for_the_lock() {
+    let root = temp_dir();
+    let path = root.join("audit.jsonl");
+    let audit = audit::open(&path).unwrap();
+    let lock = audit.lock().await;
+    let mut request = audit::RequestAudit::new(audit.clone(), "codex", "request".into());
+    request.record.outcome = "completed".into();
+    let mut finish = Box::pin(request.finish());
+    std::future::poll_fn(|context| {
+        assert!(std::future::Future::poll(finish.as_mut(), context).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    drop(finish);
+    drop(lock);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if !fs::read_to_string(&path).unwrap().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let lines = fs::read_to_string(&path).unwrap();
+    assert_eq!(lines.lines().count(), 1);
+    let record: serde_json::Value = serde_json::from_str(&lines).unwrap();
+    assert_eq!(record["outcome"], "completed");
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -211,6 +478,7 @@ fn concurrent_audit_lines_do_not_interleave() {
                     outcome: "completed".into(),
                     input_tokens: None,
                     output_tokens: None,
+                    ..audit::AuditRecord::default()
                 };
                 audit::append(&audit, &record).await.unwrap();
             }));

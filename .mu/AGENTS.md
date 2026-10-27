@@ -207,10 +207,12 @@ chunk boundaries, LF/CRLF events, multiline `data:` fields, split UTF-8, and
 malformed JSON. An unfinished event may be at most 256 KiB. Observer failure
 does not stop forwarding, but it forces audit outcome `uninspected`.
 
-Audit records retain only provider, request/response IDs, timestamps, model,
-byte counts, upstream HTTP status, terminal outcome, and observable token
-counts. Payloads, tokens, account data, headers, errors, and hashes are not
-stored. Codex and Copilot services share one audit file. Each record is
+Audit records retain only provider/operation, request/response IDs, timestamps,
+monotonic timings, requested/reported model and service tier, byte counts,
+local/upstream HTTP status, attempt/recovery counts, terminal outcome, and
+observable token counts (including cache and reasoning details). Payloads,
+authentication tokens, account data, general headers, errors, and hashes are not
+stored. Provider services share one audit file. Each record is
 serialized once and appended under both an in-process mutex and a cross-process
 `flock`, so lines from the two service instances do not interleave. Writes are
 not synchronously forced to stable storage per request; this is intentional
@@ -219,6 +221,17 @@ not change the meaning of an existing audit field after it is introduced. When
 new information needs to be persisted, use a new field name or add a new field
 without versioning the record.
 
+One RequestAudit owns each handled HTTP request through rejection, pre-header
+failure/cancellation, or relay completion. Retries stay in that record.
+`received_at` and monotonic timing offsets start at handler entry before upload;
+`started_at` retains its relay-start meaning after upload/validation. Missing
+metadata stays absent, including reported model/tier; never infer it from the
+request. First-output timing requires a nonempty recognized output delta, not
+a lifecycle event or first byte. `first_text_ms` excludes reasoning/tool deltas.
+Delta chunking, hidden reasoning, network buffering, and backpressure mean
+decode-window TPS is only an estimate. Images have no token-delta timings.
+See README for exact fields, formulas, and aggregation denominators.
+
 The systemd journal is for c2a's own process and service diagnostics, mostly
 errors. It is not request or response logging; actual request/response
 information belongs in the metadata-only audit log and must not be added to the
@@ -226,7 +239,7 @@ journal by default.
 
 Possible relay outcomes include `completed`, `incomplete`, `failed`,
 `upstream_error`, `premature_eof`, `client_disconnect`, `shutdown`, and
-`uninspected`.
+`uninspected`. Local validation/admission failures use `rejected`.
 
 ### Shutdown and sockets
 

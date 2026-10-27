@@ -67,6 +67,24 @@ impl Server {
         request.extend_from_slice(body);
         self.request(&request)
     }
+
+    fn audit_records(&self, count: usize) -> Vec<serde_json::Value> {
+        let path = self.root.join("c2a/audit.jsonl");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let contents = fs::read_to_string(&path).unwrap_or_default();
+            if let Ok(records) = contents
+                .lines()
+                .map(serde_json::from_str)
+                .collect::<serde_json::Result<Vec<serde_json::Value>>>()
+                && records.len() >= count
+            {
+                return records;
+            }
+            assert!(Instant::now() < deadline, "audit records did not appear");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
 
 impl Drop for Server {
@@ -86,6 +104,38 @@ fn status(response: &[u8]) -> u16 {
         .unwrap()
         .parse()
         .unwrap()
+}
+
+fn assert_audit_record(
+    record: &serde_json::Value,
+    operation: &str,
+    status: u16,
+    outcome: &str,
+    request_bytes: u64,
+) {
+    assert_eq!(record["provider"], "codex");
+    assert_eq!(record["operation"], operation);
+    assert_eq!(record["local_http_status"], status);
+    assert_eq!(record["outcome"], outcome);
+    assert_eq!(record["request_bytes"], request_bytes);
+    assert_eq!(record["upstream_attempts"], 0);
+    assert_eq!(record["auth_retries"], 0);
+    assert!(record["duration_ms"].as_f64().unwrap() >= 0.0);
+    assert!(record.get("upstream_http_status").is_none());
+    for field in [
+        "method",
+        "url",
+        "headers",
+        "error",
+        "prompt",
+        "request_body",
+        "response_body",
+    ] {
+        assert!(
+            record.get(field).is_none(),
+            "unexpected audit field: {field}"
+        );
+    }
 }
 
 fn post(body: &[u8], content_type: &str) -> Vec<u8> {
@@ -114,6 +164,73 @@ fn validates_path_method_and_content_type() {
             .contains("allow: post")
     );
     assert_eq!(status(&post(b"{}", "text/plain")), 415);
+}
+
+#[test]
+fn audits_local_rejections_and_auth_failure_without_request_secrets() {
+    let server = Server::start("codex");
+
+    let unknown = server.request(
+        b"GET /audit-route-secret?value=audit-url-secret HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status(&unknown), 404);
+
+    let method = server.request(
+        b"GET /v1/responses?value=audit-method-secret HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    );
+    assert_eq!(status(&method), 405);
+
+    assert_eq!(
+        status(&server.post("/v1/responses", b"audit-body-secret", "text/plain")),
+        415
+    );
+
+    let invalid = br#"{"model":"gpt-5.6-luna","stream":false,"input":"audit-prompt-secret"}"#;
+    assert_eq!(
+        status(&server.post("/v1/responses", invalid, "application/json")),
+        400
+    );
+
+    let valid = br#"{"model":"gpt-5.6-luna","stream":true,"input":"audit-prompt-secret"}"#;
+    let mut request = format!(
+        "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nAuthorization: Bearer audit-header-secret\r\nOriginator: audit-originator-secret\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        valid.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(valid);
+    assert_eq!(status(&server.request(&request)), 502);
+
+    let records = server.audit_records(5);
+    assert_eq!(records.len(), 5);
+    assert_audit_record(&records[0], "unknown", 404, "rejected", 0);
+    assert_eq!(records[0]["model"], "");
+    assert_audit_record(&records[1], "responses", 405, "rejected", 0);
+    assert_eq!(records[1]["model"], "");
+    assert_audit_record(&records[2], "responses", 415, "rejected", 0);
+    assert_eq!(records[2]["model"], "");
+    assert_audit_record(
+        &records[3],
+        "responses",
+        400,
+        "rejected",
+        invalid.len() as u64,
+    );
+    assert_eq!(records[3]["model"], "");
+    assert_audit_record(&records[4], "responses", 502, "failed", valid.len() as u64);
+    assert_eq!(records[4]["model"], "gpt-5.6-luna");
+
+    let audit = fs::read_to_string(server.root.join("c2a/audit.jsonl")).unwrap();
+    for secret in [
+        "audit-route-secret",
+        "audit-url-secret",
+        "audit-method-secret",
+        "audit-body-secret",
+        "audit-prompt-secret",
+        "audit-header-secret",
+        "audit-originator-secret",
+    ] {
+        assert!(!audit.contains(secret));
+    }
 }
 
 #[test]
@@ -274,4 +391,13 @@ fn image_admission_is_bounded_before_body_collection() {
         400
     );
     drop(pending);
+
+    let records = server.audit_records(4);
+    assert_eq!(records.len(), 4);
+    let rejected = records
+        .iter()
+        .find(|record| record["local_http_status"] == 503)
+        .expect("image admission rejection should be audited");
+    assert_audit_record(rejected, "images.generations", 503, "rejected", 0);
+    assert_eq!(rejected["model"], "");
 }

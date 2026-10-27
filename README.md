@@ -273,23 +273,134 @@ quota. Callers should likewise avoid automatic retries.
 
 ## Audit records
 
-Each upstream request produces one JSON line in the shared `audit.jsonl`.
-New records identify the provider and operation (`responses`,
-`images.generations`, or `images.edits`) and contain timestamps, byte counts,
-request/response IDs, model, terminal outcome, and input/output token counts
-when observable from the SSE stream or image JSON. Images may also record a
-distinct `upstream_imagegen_request_id`; it is never substituted for a Responses
-ID. `model` is the requested model ID; Responses records also include
-`response_model` when upstream reports a nonempty model name in the SSE stream.
-Different names may reflect alias resolution, not necessarily an incorrect
-model. Images do not currently report a served model name.
-`upstream_http_status` is absent when an image operation fails before an
-upstream response is received. Existing records are left unchanged.
-Request bodies, response bodies, tokens, account data, headers,
-errors, and payload hashes are not retained. Bounded upstream error details are
-returned only in the immediate local error response. Upstream HTTP errors keep
-their status, `Retry-After`, and sanitized request ID; failures within c2a are
-returned as `502 Bad Gateway`.
+Each handled local HTTP request produces one final JSON line in the shared
+`audit.jsonl`, including validation/admission rejections, authentication or
+connection failures, and relays cancelled before response headers. A retry is
+part of the same local request, not a separate audit line. Requests rejected by
+the HTTP parser before the handler runs are not audited. Forced termination or
+a crash can still prevent a final record.
 
-Audit lines are directly locked and appended immediately, but are not
-synchronously forced to stable storage for every request.
+Records identify `provider`, `operation` (`responses`, `images.generations`,
+`images.edits`, or `unknown` for an unsupported route), local `request_id`, byte
+counts, timestamps, outcome, and available upstream IDs. Images may include a
+distinct `upstream_imagegen_request_id`, never substituted for `response_id`.
+Unknown optional values are omitted, not written as zero or inferred.
+
+### Model, tier, usage, and outcomes
+
+| Field | Meaning |
+| --- | --- |
+| `model` | Requested model; empty for requests rejected before successful validation |
+| `response_model` | Last nonempty model ID reported by upstream |
+| `requested_service_tier` | Requested Responses service tier, when supplied |
+| `response_service_tier` | Last nonempty tier reported by upstream, independent of the requested tier |
+| `input_tokens`, `output_tokens`, `total_tokens` | Upstream usage counts, when reported |
+| `cached_input_tokens` | `usage.input_tokens_details.cached_tokens` |
+| `reasoning_output_tokens` | `usage.output_tokens_details.reasoning_tokens` |
+| `upstream_attempts` | Inference HTTP sends started, including failed sends; excludes OAuth, refresh, and discovery requests |
+| `auth_retries` | Credential-recovery retries entered after an upstream 401; a retry may fail before another send, or reuse another request's refreshed credentials |
+| `local_http_status` | Status handed back to the local HTTP handler; absent if cancelled before that handoff |
+| `upstream_http_status` | Last upstream response status received; absent if no response headers were received |
+
+Compare `model` and `response_model` for an exact-string sanity check. A missing
+response model means **unknown**, not a match; different names can reflect alias
+resolution rather than an incorrect model. Images also record model/tier when
+reported, but the image backend often omits them. A reported model name is not
+independent proof of which model executed the request. We do not reject or
+rewrite responses based on model or tier differences.
+
+Responses usage and metadata are observed from SSE; Images metadata is extracted
+selectively from JSON without decoding image data. Partial usage events do not
+erase earlier observed counts. A reported zero is retained distinctly from an
+unavailable count. New optional image metadata with an unexpected type is ignored.
+No total or detail count is synthesized from other fields.
+
+Outcomes remain `completed`, `incomplete`, `failed`, `upstream_error`,
+`premature_eof`, `client_disconnect`, `shutdown`, and `uninspected`; local
+validation/admission failures use `rejected`. `uninspected` means observation or
+validation failed, not necessarily that forwarding failed. An upstream success
+status alone does not establish successful completion: inspect `outcome` too.
+
+### Timing and throughput
+
+All numeric timing fields use **monotonic milliseconds**, with fractional
+precision. Offsets are measured from entry to the HTTP request handler, after
+headers have arrived and before body collection. They measure what c2a observes,
+not server-side inference timestamps or client receipt times.
+
+| Field | Meaning |
+| --- | --- |
+| `received_at` | UTC wall-clock time at handler entry |
+| `started_at`, `finished_at` | Existing UTC timestamps; for relays, `started_at` remains after body collection/validation; for local rejections it equals receipt time |
+| `duration_ms` | Handler entry through final relay/handler outcome, before audit append |
+| `relay_start_ms`, `relay_duration_ms` | Relay start offset and duration, excluding local body collection/validation but including authentication and retries |
+| `first_upstream_byte_ms` | First nonempty body chunk read from the response being relayed/inspected, including error bodies; not response headers or a discarded retry response |
+| `first_output_ms` | First complete, nonempty recognized output delta event |
+| `first_text_ms` | First nonempty output-text or refusal delta, excluding reasoning and tool arguments |
+| `last_output_ms` | Last recognized nonempty output delta |
+| `terminal_ms` | First completed/incomplete/failed/error terminal SSE event |
+| `first_output_kind` | Kind of the first recognized output delta, not its content |
+
+Recognized delta kinds are `output_text`, `refusal`, `function_call_arguments`,
+`custom_tool_call_input`, `reasoning_text`, and `reasoning_summary_text`.
+Lifecycle events such as `response.created`, empty deltas, unknown event types,
+and `[DONE]` are not counted as first output. Events split across chunks are
+timed when their terminating chunk arrives. Images are non-streaming and omit
+output/terminal SSE timings rather than pretending their first byte is a token.
+
+For rows with the required fields and positive denominators:
+
+| Metric | Calculation |
+| --- | --- |
+| Observed TTFT | `first_output_ms` (or `first_text_ms` for visible text only) |
+| Relay-only TTFT | `first_output_ms - relay_start_ms` |
+| Whole-duration output TPS | `1000 * output_tokens / duration_ms` |
+| Relay-only average output TPS | `1000 * output_tokens / relay_duration_ms` |
+| Decode-window output TPS estimate | `1000 * output_tokens / (terminal_ms - first_output_ms)` |
+| Token-weighted cache hit rate | `cached_input_tokens / input_tokens` |
+| Reasoning-token ratio | `reasoning_output_tokens / output_tokens` |
+
+`last_output_ms - first_output_ms` is also available for a last-delta decode
+window that excludes time between the last delta and the terminal event.
+**Decode-window TPS is an estimate, not exact per-token decoding speed.** One
+delta can contain multiple tokens, several events can arrive in one chunk, and
+hidden reasoning tokens may be counted in usage without observable deltas.
+Reasoning summaries need not correspond to the actual reasoning-token stream.
+Tool execution, network buffering, and downstream backpressure can affect these
+intervals. We do not invent a token timestamp from usage or a lifecycle event,
+or assume the first delta contains exactly one token. A missing first-output
+time or a zero-width window means decode TPS is unavailable.
+
+Use completed, inspected Responses for comparable token-rate statistics; handle
+failed/incomplete requests separately. Aggregate cache/reasoning ratios by
+summing numerators and denominators **over the same rows where both are known**,
+not by treating missing values as zero. Request-level cache hit rate can instead
+be computed as the fraction of rows with known `cached_input_tokens` greater
+than zero. Rates/ratios are derived at query time, not redundantly persisted.
+
+`request_bytes` is the collected local body size (zero when collection was not
+completed). `response_bytes` retains its existing meaning: upstream body bytes
+read, with error bodies bounded to the inspection limit. It is not a count of
+bytes delivered to the client. Completion means c2a finished reading/handing off
+the stream or buffered image response; the client may still be draining queued
+bytes. Existing audit records are left unchanged and lack new fields.
+
+Field/event references: [Responses API](https://developers.openai.com/api/reference/resources/responses/methods/create)
+and [streaming events](https://developers.openai.com/api/reference/resources/responses/streaming-events/).
+
+### Persistence and privacy
+
+The location remains `$XDG_STATE_HOME/c2a/audit.jsonl`, or
+`~/.local/state/c2a/audit.jsonl` when XDG state is unset. The state directory is
+`0700`; the regular, user-owned audit file is `0600`. Provider processes share
+one append-only JSONL file, serialized under an in-process mutex and an exclusive
+cross-process `flock`. Records are appended at completion, not per event. Writes
+are not synchronously forced to stable storage per request. There is no built-in
+rotation or retention policy. Audit append failures are reported on stderr;
+under systemd these process diagnostics normally go to the journal.
+
+Request/response bodies, prompts, generated content, authentication tokens,
+account data, general headers, errors, and payload hashes are not retained.
+Bounded upstream error details are returned only in the immediate local error
+response. Upstream HTTP errors keep their status, `Retry-After`, and sanitized
+request ID; failures within c2a are returned as `502 Bad Gateway`.
