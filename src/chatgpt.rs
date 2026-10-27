@@ -39,6 +39,12 @@ const SHARING_SCOPE: &str = "chatgpt.tokens.use.direct";
 const SCOPES: &str =
     "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct";
 pub const UPSTREAM: &str = "https://api.openai.com/v1/responses";
+// SIWC cache affinity: CLIProxyAPI 1f917e77c456 (2026-10-27),
+// internal/runtime/executor/codex_executor_request.go, applyCodexHeadersWithSIWC.
+// Unlike the Codex backend's session-id, this header uses an underscore.
+// Live gpt-6-luna probe 2026-10-27: three identical 6,981-token requests per
+// variant cached 0/0/0 tokens without it versus 0/6,784/6,784 with it.
+pub const SESSION_ID_HEADER: &str = "session_id";
 pub const USAGE_URL: &str = "https://chatgpt.com/settings/usage";
 const CALLBACK_LIMIT: usize = 16 * 1024;
 

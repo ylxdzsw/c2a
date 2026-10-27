@@ -472,13 +472,21 @@ fn chatgpt_request(
     metadata: &RequestMetadata,
     access_token: &str,
 ) -> reqwest::RequestBuilder {
-    client
+    let mut request = client
         .post(chatgpt::UPSTREAM)
         .bearer_auth(access_token)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .header(reqwest::header::ACCEPT, "text/event-stream")
         .headers(metadata.identity_headers.clone())
-        .body(body)
+        .body(body);
+    if let Some(value) = metadata
+        .prompt_cache_key
+        .as_deref()
+        .and_then(valid_header_value)
+    {
+        request = request.header(chatgpt::SESSION_ID_HEADER, value);
+    }
+    request
 }
 
 fn codex_request(
@@ -747,6 +755,44 @@ mod tests {
             device::ROUTING_HINT_HEADER,
         ] {
             assert!(request.headers().get(name).is_none());
+        }
+    }
+
+    #[test]
+    fn chatgpt_session_header_uses_only_a_header_safe_body_cache_key() {
+        for key in [None, Some("mu:session-1:epoch:0"), Some("bad\nkey")] {
+            let bytes = hyper::body::Bytes::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "model": "m", "stream": true, "store": false,
+                    "input": [], "prompt_cache_key": key,
+                }))
+                .unwrap(),
+            );
+            let request = chatgpt_request(
+                &reqwest::Client::new(),
+                bytes.clone(),
+                &RequestMetadata {
+                    prompt_cache_key: key.map(str::to_owned),
+                    ..metadata()
+                },
+                "access",
+            )
+            .build()
+            .unwrap();
+            assert_eq!(request.body().unwrap().as_bytes().unwrap(), bytes);
+            assert_eq!(
+                request.headers().get(crate::chatgpt::SESSION_ID_HEADER),
+                key.filter(|key| !key.contains('\n'))
+                    .map(|key| key.parse::<hyper::header::HeaderValue>().unwrap())
+                    .as_ref(),
+            );
+            for name in [
+                device::SESSION_ID_HEADER,
+                device::ROUTING_HINT_HEADER,
+                "x-client-request-id",
+            ] {
+                assert!(request.headers().get(name).is_none());
+            }
         }
     }
 

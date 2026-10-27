@@ -209,6 +209,10 @@ c2a's own identity, including ChatGPT's application registration.
 For Codex backend compatibility, c2a derives `session-id` from the
 body's `prompt_cache_key` and derives `x-codex-routing-hint` from `model` and an
 optional `service_tier`.
+For ChatGPT SIWC, c2a derives `session_id` (underscore) from the same body key;
+it does not add `session-id`, `x-codex-routing-hint`, or `x-client-request-id`.
+An absent or header-unsafe key omits the derived session header on either
+provider without changing the request body.
 
 ## Generate and edit images
 
