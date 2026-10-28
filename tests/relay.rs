@@ -191,7 +191,7 @@ fn audits_local_rejections_and_auth_failure_without_request_secrets() {
         400
     );
 
-    let valid = br#"{"model":"gpt-5.6-luna","stream":true,"input":"audit-prompt-secret"}"#;
+    let valid = br#"{"model":"gpt-5.6-luna","stream":true,"reasoning":{"effort":"high"},"input":"audit-prompt-secret"}"#;
     let mut request = format!(
         "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nAuthorization: Bearer audit-header-secret\r\nOriginator: audit-originator-secret\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         valid.len()
@@ -218,6 +218,8 @@ fn audits_local_rejections_and_auth_failure_without_request_secrets() {
     assert_eq!(records[3]["model"], "");
     assert_audit_record(&records[4], "responses", 502, "failed", valid.len() as u64);
     assert_eq!(records[4]["model"], "gpt-5.6-luna");
+    assert_eq!(records[4]["requested_reasoning_effort"], "high");
+    assert!(records[4].get("response_reasoning_effort").is_none());
 
     let audit = fs::read_to_string(server.root.join("c2a/audit.jsonl")).unwrap();
     for secret in [

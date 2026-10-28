@@ -174,6 +174,33 @@ fn sse_model_is_optional_and_retained_when_later_events_omit_it() {
 }
 
 #[test]
+fn sse_effort_retains_last_nonempty_reported_value() {
+    let mut observer = audit::SseObserver::new();
+    for expected in [None, Some("high"), Some("none")] {
+        if let Some(effort) = expected {
+            let event = serde_json::json!({"response": {"reasoning": {"effort": effort}}});
+            observer.feed_at(format!("data: {event}\n\n").as_bytes(), 0.0);
+        }
+        for response in [
+            serde_json::json!({}),
+            serde_json::json!({"reasoning": null}),
+            serde_json::json!({"reasoning": {"effort": null}}),
+            serde_json::json!({"reasoning": {"effort": ""}}),
+            serde_json::json!({"reasoning": {"effort": 42}}),
+        ] {
+            let event = serde_json::json!({"response": response});
+            observer.feed_at(format!("data: {event}\n\n").as_bytes(), 0.0);
+            assert_eq!(
+                observer.observation.response_reasoning_effort.as_deref(),
+                expected
+            );
+        }
+    }
+    observer.finish();
+    assert!(!observer.failed());
+}
+
+#[test]
 fn malformed_or_oversized_events_become_uninspected() {
     let mut malformed = audit::SseObserver::new();
     malformed.feed_at(b"data: {bad}\n\n", 0.0);
@@ -230,6 +257,8 @@ fn audit_serialization_omits_unavailable_and_secret_fields() {
         "total_tokens",
         "requested_service_tier",
         "response_service_tier",
+        "requested_reasoning_effort",
+        "response_reasoning_effort",
     ] {
         assert!(!object.contains_key(optional), "{optional}");
     }
@@ -273,6 +302,8 @@ fn audit_serialization_includes_known_statistics() {
         total_tokens: Some(9),
         requested_service_tier: Some("auto".into()),
         response_service_tier: Some("priority".into()),
+        requested_reasoning_effort: Some("high".into()),
+        response_reasoning_effort: Some("medium".into()),
         ..audit::AuditRecord::default()
     };
     let value = serde_json::to_value(record).unwrap();
@@ -294,6 +325,8 @@ fn audit_serialization_includes_known_statistics() {
     assert_eq!(value["total_tokens"], 9);
     assert_eq!(value["requested_service_tier"], "auto");
     assert_eq!(value["response_service_tier"], "priority");
+    assert_eq!(value["requested_reasoning_effort"], "high");
+    assert_eq!(value["response_reasoning_effort"], "medium");
 }
 
 #[test]

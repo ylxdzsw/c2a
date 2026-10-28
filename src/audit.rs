@@ -78,6 +78,10 @@ pub struct AuditRecord {
     pub requested_service_tier: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_service_tier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_reasoning_effort: Option<String>,
 }
 
 pub type Audit = Arc<Mutex<File>>;
@@ -228,6 +232,7 @@ pub struct Observation {
     pub response_id: Option<String>,
     pub response_model: Option<String>,
     pub response_service_tier: Option<String>,
+    pub response_reasoning_effort: Option<String>,
     pub outcome: Option<String>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
@@ -327,6 +332,13 @@ impl SseObserver {
             .filter(|service_tier| !service_tier.is_empty())
         {
             self.observation.response_service_tier = Some(service_tier.to_owned());
+        }
+        if let Some(effort) = response
+            .pointer("/reasoning/effort")
+            .and_then(Value::as_str)
+            .filter(|effort| !effort.is_empty())
+        {
+            self.observation.response_reasoning_effort = Some(effort.to_owned());
         }
         if let Some(id) = response
             .get("id")

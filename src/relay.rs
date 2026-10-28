@@ -64,6 +64,7 @@ pub struct RequestMetadata {
     pub model: String,
     pub prompt_cache_key: Option<String>,
     pub service_tier: Option<String>,
+    pub reasoning_effort: Option<String>,
     pub identity_headers: HeaderMap,
 }
 
@@ -137,6 +138,7 @@ impl Relay {
         audit.record.model = metadata.model.clone();
         audit.record.request_bytes = body.len() as u64;
         audit.record.requested_service_tier = metadata.service_tier.clone();
+        audit.record.requested_reasoning_effort = metadata.reasoning_effort.clone();
         let relay = self.clone();
         if metadata.operation != Operation::Responses {
             return images::start(audit, permits, shutdown, move |record| {
@@ -436,6 +438,7 @@ async fn observe_stream(
     audit.record.response_id = observation.response_id.clone();
     audit.record.response_model = observation.response_model.clone();
     audit.record.response_service_tier = observation.response_service_tier.clone();
+    audit.record.response_reasoning_effort = observation.response_reasoning_effort.clone();
     audit.record.input_tokens = observation.input_tokens;
     audit.record.output_tokens = observation.output_tokens;
     audit.record.cached_input_tokens = observation.cached_input_tokens;
@@ -683,6 +686,7 @@ mod tests {
             model: "m".into(),
             prompt_cache_key: None,
             service_tier: None,
+            reasoning_effort: None,
             identity_headers: Default::default(),
         }
     }
@@ -832,6 +836,7 @@ mod tests {
                     model: "gpt-image-2.5-flare".into(),
                     prompt_cache_key: Some("unused".into()),
                     service_tier: Some("unused".into()),
+                    reasoning_effort: None,
                     identity_headers: Default::default(),
                 },
                 &CodexCredentials {
@@ -877,6 +882,7 @@ mod tests {
                 model: "gpt-5.6-luna".into(),
                 prompt_cache_key: Some("session-1".into()),
                 service_tier: Some("priority".into()),
+                reasoning_effort: None,
                 identity_headers: Default::default(),
             },
             &CodexCredentials {
@@ -920,6 +926,7 @@ mod tests {
                 model: "gpt-5".into(),
                 prompt_cache_key: Some("bad\nkey".into()),
                 service_tier: None,
+                reasoning_effort: None,
                 identity_headers: Default::default(),
             },
             &CodexCredentials {
@@ -1033,13 +1040,14 @@ mod tests {
         use http_body_util::BodyExt;
 
         let bytes = concat!(
-            "data: {\"type\":\"response.created\",\"response\":{\"model\":\"served-model\",\"service_tier\":\"default\"}}\n\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"model\":\"served-model\",\"service_tier\":\"default\",\"reasoning\":{\"effort\":\"medium\"}}}\n\n",
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"content-not-retained\"}\n\n",
             "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_test\",\"usage\":{\"input_tokens\":100,\"output_tokens\":20,\"total_tokens\":120,\"input_tokens_details\":{\"cached_tokens\":80},\"output_tokens_details\":{\"reasoning_tokens\":5}}}}\n\n",
         ).as_bytes().to_vec();
         let mut upstream: reqwest::Response = hyper::Response::new(bytes.clone()).into();
         let (path, mut audit) = test_audit();
         let (mut sender, body) = http_body_util::Channel::new(4);
+        audit.record.requested_reasoning_effort = Some("high".into());
         let (_shutdown, mut receiver) = tokio::sync::watch::channel(false);
         super::observe_stream(&mut upstream, &mut sender, &mut audit, &mut receiver).await;
         drop(sender);
@@ -1050,6 +1058,8 @@ mod tests {
         assert_eq!(value["model"], "requested-alias");
         assert_eq!(value["response_model"], "served-model");
         assert_eq!(value["response_service_tier"], "default");
+        assert_eq!(value["requested_reasoning_effort"], "high");
+        assert_eq!(value["response_reasoning_effort"], "medium");
         assert_eq!(value["cached_input_tokens"], 80);
         assert_eq!(value["reasoning_output_tokens"], 5);
         assert_eq!(value["total_tokens"], 120);

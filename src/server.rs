@@ -348,6 +348,11 @@ fn validate_body(
             .get("service_tier")
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned),
+        reasoning_effort: value
+            .pointer("/reasoning/effort")
+            .and_then(serde_json::Value::as_str)
+            .filter(|effort| !effort.is_empty())
+            .map(str::to_owned),
     })
 }
 
@@ -499,12 +504,44 @@ mod tests {
 
     #[test]
     fn validation_does_not_rewrite_request_bytes() {
-        let bytes = br#"{ "stream": true, "model": "gpt-5", "prompt_cache_key": "session-1", "service_tier": "priority", "input": [1, 2] }"#.to_vec();
+        let bytes = br#"{ "stream": true, "model": "gpt-5", "prompt_cache_key": "session-1", "service_tier": "priority", "reasoning": {"effort": "high"}, "input": [1, 2] }"#.to_vec();
         let original = bytes.clone();
         let metadata = validate_body(&bytes, crate::provider::Provider::Codex).unwrap();
         assert_eq!(metadata.model, "gpt-5");
         assert_eq!(metadata.prompt_cache_key.as_deref(), Some("session-1"));
         assert_eq!(metadata.service_tier.as_deref(), Some("priority"));
+        assert_eq!(metadata.reasoning_effort.as_deref(), Some("high"));
         assert_eq!(bytes, original);
+    }
+
+    #[test]
+    fn reasoning_effort_is_optional_metadata_not_validation() {
+        for reasoning in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!({"effort": null}),
+            serde_json::json!({"effort": ""}),
+            serde_json::json!({"effort": 42}),
+            serde_json::json!({"effort": "future-effort"}),
+        ] {
+            let request = serde_json::json!({"stream": true, "model": "m", "reasoning": reasoning});
+            let metadata = validate_body(
+                &serde_json::to_vec(&request).unwrap(),
+                crate::provider::Provider::Codex,
+            )
+            .unwrap();
+            assert_eq!(
+                metadata.reasoning_effort.as_deref(),
+                reasoning["effort"]
+                    .as_str()
+                    .filter(|effort| !effort.is_empty())
+            );
+        }
+        let metadata = validate_body(
+            br#"{"stream":true,"model":"m"}"#,
+            crate::provider::Provider::Codex,
+        )
+        .unwrap();
+        assert!(metadata.reasoning_effort.is_none());
     }
 }

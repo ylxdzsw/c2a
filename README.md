@@ -286,7 +286,7 @@ counts, timestamps, outcome, and available upstream IDs. Images may include a
 distinct `upstream_imagegen_request_id`, never substituted for `response_id`.
 Unknown optional values are omitted, not written as zero or inferred.
 
-### Model, tier, usage, and outcomes
+### Model, tier, effort, usage, and outcomes
 
 | Field | Meaning |
 | --- | --- |
@@ -294,6 +294,8 @@ Unknown optional values are omitted, not written as zero or inferred.
 | `response_model` | Last nonempty model ID reported by upstream |
 | `requested_service_tier` | Requested Responses service tier, when supplied |
 | `response_service_tier` | Last nonempty tier reported by upstream, independent of the requested tier |
+| `requested_reasoning_effort` | Nonempty Responses `reasoning.effort`, when supplied |
+| `response_reasoning_effort` | Last nonempty `response.reasoning.effort` reported in the Responses stream, independent of the requested effort |
 | `input_tokens`, `output_tokens`, `total_tokens` | Upstream usage counts, when reported |
 | `cached_input_tokens` | `usage.input_tokens_details.cached_tokens` |
 | `reasoning_output_tokens` | `usage.output_tokens_details.reasoning_tokens` |
@@ -301,6 +303,10 @@ Unknown optional values are omitted, not written as zero or inferred.
 | `auth_retries` | Credential-recovery retries entered after an upstream 401; a retry may fail before another send, or reuse another request's refreshed credentials |
 | `local_http_status` | Status handed back to the local HTTP handler; absent if cancelled before that handoff |
 | `upstream_http_status` | Last upstream response status received; absent if no response headers were received |
+
+Effort fields describe reasoning configuration, not measured reasoning work.
+Missing effort stays omitted; no model default or requested value is substituted
+for an unreported response effort.
 
 Compare `model` and `response_model` for an exact-string sanity check. A missing
 response model means **unknown**, not a match; different names can reflect alias
