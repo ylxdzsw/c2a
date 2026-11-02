@@ -64,6 +64,9 @@ pub struct AuditRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_id: Option<String>,
     pub outcome: String,
+    // Serialized from provider quota structs, never from raw upstream JSON.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]

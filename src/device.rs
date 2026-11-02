@@ -5,6 +5,7 @@ use serde::{Deserialize, Deserializer, Serialize, de};
 use sha2::{Digest, Sha256};
 
 use crate::{
+    audit::RequestAudit,
     claims,
     error::{Error, Result},
     provider::USER_AGENT,
@@ -25,25 +26,30 @@ pub const ROUTING_HINT_HEADER: &str = "x-codex-routing-hint";
 const RESPONSE_LIMIT: usize = 64 * 1024;
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Quota {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimit>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub additional_rate_limits: Option<Vec<AdditionalRateLimit>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct AdditionalRateLimit {
     pub limit_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimit>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct RateLimit {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub primary_window: Option<RateLimitWindow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub secondary_window: Option<RateLimitWindow>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct RateLimitWindow {
     pub used_percent: f64,
     pub limit_window_seconds: i64,
@@ -172,6 +178,7 @@ pub async fn quota(
     client: &reqwest::Client,
     access_token: &str,
     account_id: &str,
+    audit: &mut RequestAudit,
 ) -> Result<Quota> {
     let response = client
         .get(QUOTA_URL)
@@ -181,13 +188,7 @@ pub async fn quota(
         .header(reqwest::header::USER_AGENT, USER_AGENT)
         .send()
         .await?;
-    if !response.status().is_success() {
-        return Err(Error::message(format!(
-            "Codex quota request failed with status {}",
-            response.status().as_u16()
-        )));
-    }
-    decode(response).await
+    decode_quota(response, audit).await
 }
 
 fn verify_pkce(code: &AuthorizationCode) -> Result<()> {
@@ -213,10 +214,40 @@ where
 }
 
 pub(crate) async fn decode<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+) -> Result<T> {
+    decode_inner(response, None).await
+}
+
+pub(crate) async fn decode_quota<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    audit: &mut RequestAudit,
+) -> Result<T> {
+    crate::relay::record_upstream(&response, &mut audit.record);
+    if !response.status().is_success() {
+        audit.record.outcome = "upstream_error".into();
+        return Err(Error::message(format!(
+            "{} quota request failed with status {}",
+            audit.record.provider,
+            response.status().as_u16()
+        )));
+    }
+    decode_inner(response, Some(audit)).await
+}
+
+async fn decode_inner<T: serde::de::DeserializeOwned>(
     mut response: reqwest::Response,
+    mut audit: Option<&mut RequestAudit>,
 ) -> Result<T> {
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await? {
+        if let Some(audit) = audit.as_deref_mut() {
+            audit.record.response_bytes += chunk.len() as u64;
+            if !chunk.is_empty() {
+                let elapsed = audit.elapsed_ms();
+                audit.record.first_upstream_byte_ms.get_or_insert(elapsed);
+            }
+        }
         if bytes.len() + chunk.len() > RESPONSE_LIMIT {
             return Err(Error::message("upstream JSON response exceeds 64 KiB"));
         }
@@ -232,6 +263,8 @@ mod tests {
     #[test]
     fn quota_response_preserves_windows_and_additional_limits() {
         let quota: Quota = serde_json::from_value(serde_json::json!({
+            "account_id": "not-audited",
+            "plan_type": "not-audited",
             "rate_limit": {
                 "primary_window": {
                     "used_percent": 20,
@@ -257,6 +290,28 @@ mod tests {
         }))
         .unwrap();
 
+        let record = crate::audit::AuditRecord {
+            operation: "quota".into(),
+            quota: Some(serde_json::to_value(&quota).unwrap()),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(record).unwrap();
+        assert_eq!(value["operation"], "quota");
+        assert_eq!(
+            value["quota"],
+            serde_json::json!({
+                "rate_limit": {"primary_window": {
+                    "used_percent": 20.0, "limit_window_seconds": 18000, "reset_at": 123
+                }},
+                "additional_rate_limits": [{
+                    "limit_name": "code review",
+                    "rate_limit": {"primary_window": {
+                        "used_percent": 30.0, "limit_window_seconds": 604800, "reset_at": 456
+                    }}
+                }]
+            })
+        );
+
         let primary = quota.rate_limit.unwrap().primary_window.unwrap();
         assert_eq!(primary.used_percent, 20.0);
         assert_eq!(primary.limit_window_seconds, 18_000);
@@ -274,5 +329,48 @@ mod tests {
                 .reset_at,
             456
         );
+    }
+
+    #[tokio::test]
+    async fn quota_audit_observes_success_http_errors_and_invalid_json() {
+        let mut random = [0; 16];
+        getrandom::fill(&mut random).unwrap();
+        let path =
+            std::env::temp_dir().join(format!("c2a-quota-{:x}", u128::from_ne_bytes(random)));
+        let file = crate::audit::open(&path).unwrap();
+        for (status, body, outcome) in [
+            (200, r#"{"rate_limit":null}"#, "completed"),
+            (429, "not persisted", "upstream_error"),
+            (200, "invalid JSON", "failed"),
+        ] {
+            let mut audit = crate::audit::RequestAudit::new(file.clone(), "codex", "query".into());
+            audit.record.operation = "quota".into();
+            let response = hyper::Response::builder()
+                .status(status)
+                .header("x-request-id", "upstream-query")
+                .body(body)
+                .unwrap();
+            let result: crate::error::Result<Quota> =
+                super::decode_quota(response.into(), &mut audit).await;
+            if result.is_ok() {
+                audit.record.outcome = "completed".into();
+            }
+            assert_eq!(audit.record.outcome, outcome);
+            assert_eq!(audit.record.upstream_http_status, Some(status));
+            assert_eq!(
+                audit.record.upstream_request_id.as_deref(),
+                Some("upstream-query")
+            );
+            assert_eq!(
+                audit.record.response_bytes,
+                if status == 200 { body.len() as u64 } else { 0 }
+            );
+            audit.finish().await;
+        }
+        let records = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(records.lines().count(), 3);
+        assert!(!records.contains("not persisted"));
+        assert!(!records.contains("invalid JSON"));
+        std::fs::remove_file(path).unwrap();
     }
 }

@@ -106,6 +106,45 @@ fn credentials_are_private_minimal_and_provider_specific() {
 }
 
 #[test]
+fn quota_commands_audit_failures_but_not_chatgpt_usage_links() {
+    let root = temp_dir();
+    for provider in ["codex", "copilot"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_c2a"))
+            .args([provider, "quota"])
+            .env("XDG_STATE_HOME", &root)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let records = fs::read_to_string(root.join("c2a/audit.jsonl")).unwrap();
+        let record: serde_json::Value =
+            serde_json::from_str(records.lines().last().unwrap()).unwrap();
+        assert_eq!(record["provider"], provider);
+        assert_eq!(record["operation"], "quota");
+        assert_eq!(record["outcome"], "failed");
+        assert!(record["duration_ms"].as_f64().unwrap() >= 0.0);
+        for absent in [
+            "quota",
+            "upstream_http_status",
+            "local_http_status",
+            "upstream_attempts",
+            "auth_retries",
+        ] {
+            assert!(record.get(absent).is_none(), "{absent}");
+        }
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_c2a"))
+        .args(["chatgpt", "quota"])
+        .env("XDG_STATE_HOME", &root)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let path = root.join("c2a/audit.jsonl");
+    assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 2);
+    assert_eq!(fs::metadata(path).unwrap().mode() & 0o777, 0o600);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn credential_symlinks_are_rejected() {
     let root = temp_dir();
     let paths = paths(root.clone());

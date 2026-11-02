@@ -281,10 +281,43 @@ the HTTP parser before the handler runs are not audited. Forced termination or
 a crash can still prevent a final record.
 
 Records identify `provider`, `operation` (`responses`, `images.generations`,
-`images.edits`, or `unknown` for an unsupported route), local `request_id`, byte
+`images.edits`, `quota`, or `unknown` for an unsupported route), local `request_id`, byte
 counts, timestamps, outcome, and available upstream IDs. Images may include a
 distinct `upstream_imagegen_request_id`, never substituted for `response_id`.
 Unknown optional values are omitted, not written as zero or inferred.
+
+### Quota queries
+
+`c2a codex quota` and `c2a copilot quota` append one `operation: "quota"`
+record to the same audit file, including failed queries. The ChatGPT command
+only prints a settings link, so it does not produce a query record.
+
+The optional `quota` object contains only the parsed allowance fields, not the
+raw provider response:
+
+- **Codex:** `rate_limit` and `additional_rate_limits` (with `limit_name`).
+  Each limit may contain `primary_window` and `secondary_window`, with
+  `used_percent`, `limit_window_seconds`, and `reset_at` (Unix seconds).
+  Remaining percentage is `100 - used_percent`; values are stored unrounded.
+- **Copilot:** `reset_at` (the provider's UTC date/time, or date fallback),
+  `token_based_billing`, and `snapshots` keyed by allowance name. Snapshots
+  include available `entitlement`, `quota_remaining`, `remaining`,
+  `percent_remaining`, `unlimited`, and `token_based_billing` values.
+  Fractional credits are preserved; `quota_remaining` takes precedence over
+  `remaining` for display. Billing flags distinguish AI credits from requests.
+
+Absent optional quota fields are omitted. A parsed result is retained even if
+it contains no displayable allowance and the command fails. No result is
+invented when authentication, transport, or JSON decoding fails.
+
+Quota records include a local `request_id`, timestamps and `duration_ms`
+covering credential acquisition and the query, plus upstream status and a
+sanitized request ID when available. Outcomes are `completed`, `upstream_error`
+for an unsuccessful quota HTTP response, or `failed` for other errors.
+`model` is empty and `request_bytes` is zero; `response_bytes` counts quota body
+bytes read (error bodies are not read). Local HTTP status, inference attempt
+and retry counts, relay timings, and token usage fields are omitted. Credential
+refresh traffic is not included in the upstream status or byte counts.
 
 ### Model, tier, effort, usage, and outcomes
 

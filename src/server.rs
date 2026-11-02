@@ -379,7 +379,7 @@ fn json_error_with_id(status: StatusCode, message: &str, id: &str) -> Response<B
         .body(relay::full(bytes))
         .unwrap()
 }
-fn random_id() -> Result<String> {
+pub(crate) fn random_id() -> Result<String> {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).map_err(|error| Error::message(error.to_string()))?;
     Ok(bytes.iter().map(|value| format!("{value:02x}")).collect())

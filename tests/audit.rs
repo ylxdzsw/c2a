@@ -259,6 +259,7 @@ fn audit_serialization_omits_unavailable_and_secret_fields() {
         "response_service_tier",
         "requested_reasoning_effort",
         "response_reasoning_effort",
+        "quota",
     ] {
         assert!(!object.contains_key(optional), "{optional}");
     }

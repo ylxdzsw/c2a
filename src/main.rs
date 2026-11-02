@@ -184,27 +184,60 @@ async fn status(provider: Provider) -> Result<()> {
 }
 
 async fn quota(provider: Provider) -> Result<()> {
-    let paths = Paths::new()?;
-    let client = client()?;
-    let output = match provider {
-        Provider::Chatgpt => format!(
+    if provider == Provider::Chatgpt {
+        println!(
             "ChatGPT app limits and remaining usage: {}",
             chatgpt::USAGE_URL
-        ),
+        );
+        return Ok(());
+    }
+    let paths = Paths::new()?;
+    paths.ensure_dir()?;
+    let mut audit = audit::RequestAudit::new(
+        audit::open(&paths.audit)?,
+        provider.as_str(),
+        server::random_id()?,
+    );
+    audit.record.operation = "quota".into();
+    // These counters describe inference sends and credential-recovery retries.
+    audit.record.upstream_attempts = None;
+    audit.record.auth_retries = None;
+    let result = query_quota(provider, &paths, &mut audit).await;
+    if result.is_ok() {
+        audit.record.outcome = "completed".into();
+    }
+    audit.finish().await;
+    println!("{}", result?);
+    Ok(())
+}
+
+async fn query_quota(
+    provider: Provider,
+    paths: &Paths,
+    audit: &mut audit::RequestAudit,
+) -> Result<String> {
+    let client = client()?;
+    match provider {
+        Provider::Chatgpt => unreachable!(),
         Provider::Codex => {
-            let (credentials, claims) = refresh::credentials(&client, &paths, None).await?;
-            let quota =
-                device::quota(&client, &credentials.access_token, &claims.account_id).await?;
-            format_codex_quota(&quota)?
+            let (credentials, claims) = refresh::credentials(&client, paths, None).await?;
+            let quota = device::quota(
+                &client,
+                &credentials.access_token,
+                &claims.account_id,
+                audit,
+            )
+            .await?;
+            audit.record.quota = Some(serde_json::to_value(&quota)?);
+            format_codex_quota(&quota)
         }
         Provider::Copilot => {
-            let credentials = copilot::credentials(&client, &paths, None).await?;
-            let quota = copilot::quota(&client, &credentials.access_token).await?;
-            format_copilot_quota(&quota)?
+            let credentials = copilot::credentials(&client, paths, None).await?;
+            let quota = copilot::quota(&client, &credentials.access_token, audit).await?;
+            audit.record.quota = Some(serde_json::to_value(&quota)?);
+            format_copilot_quota(&quota)
         }
-    };
-    println!("{output}");
-    Ok(())
+    }
 }
 
 fn format_codex_quota(quota: &device::Quota) -> Result<String> {
@@ -253,7 +286,8 @@ fn format_copilot_quota(quota: &copilot::Quota) -> Result<String> {
         };
         let label = match key {
             "premium_interactions"
-                if quota.token_based_billing || snapshot.token_based_billing.unwrap_or(false) =>
+                if quota.token_based_billing.unwrap_or(false)
+                    || snapshot.token_based_billing.unwrap_or(false) =>
             {
                 "AI credits"
             }
@@ -262,7 +296,7 @@ fn format_copilot_quota(quota: &copilot::Quota) -> Result<String> {
             "completions" => "completions",
             _ => unreachable!(),
         };
-        if snapshot.unlimited {
+        if snapshot.unlimited.unwrap_or(false) {
             lines.push(format!("{label}: unlimited"));
             continue;
         }

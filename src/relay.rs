@@ -375,7 +375,7 @@ impl Relay {
 
 type UpstreamStream = (reqwest::Response, http_body_util::channel::Sender<Bytes>);
 
-fn record_upstream(response: &reqwest::Response, record: &mut AuditRecord) {
+pub(crate) fn record_upstream(response: &reqwest::Response, record: &mut AuditRecord) {
     record.upstream_http_status = Some(response.status().as_u16());
     record.upstream_request_id = sanitize_request_id(
         response
