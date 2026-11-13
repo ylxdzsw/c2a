@@ -2,10 +2,10 @@
 name = "c2a"
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.100"
 
 [dependencies]
-base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+base64 = { version = "0.23", default-features = false, features = ["alloc"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 getrandom = "0.4"
 http-body-util = { version = "0.1", features = ["channel"] }

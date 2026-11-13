@@ -2,7 +2,6 @@ use std::{
     fs::{File, OpenOptions},
     io::{self, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
-    os::unix::io::AsRawFd,
     path::Path,
     sync::Arc,
     time::Instant,
@@ -209,16 +208,9 @@ pub async fn append(audit: &Audit, record: &AuditRecord) -> io::Result<()> {
     let mut bytes = serde_json::to_vec(record).map_err(io::Error::other)?;
     bytes.push(b'\n');
     let mut file = audit.lock().await;
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
+    file.lock()?;
     let result = file.write_all(&bytes);
-    let unlock = if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) } != 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    };
-    result.and(unlock)
+    result.and(file.unlock())
 }
 
 pub fn timestamp() -> String {
@@ -300,12 +292,12 @@ impl SseObserver {
         let data = text
             .split_terminator('\n')
             .filter_map(|line| {
-                let line = line.strip_suffix('\r').unwrap_or(line);
+                let line = line.trim_suffix('\r');
                 if line == "data" {
                     Some("")
                 } else {
                     line.strip_prefix("data:")
-                        .map(|value| value.strip_prefix(' ').unwrap_or(value))
+                        .map(|value| value.trim_prefix(' '))
                 }
             })
             .collect::<Vec<_>>()

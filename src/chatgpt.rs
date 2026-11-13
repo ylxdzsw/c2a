@@ -218,7 +218,7 @@ async fn login_inner(client: &reqwest::Client, paths: &Paths) -> Result<()> {
     );
     std::io::stdout().flush()?;
     let callback = tokio::time::timeout(
-        Duration::from_secs(900),
+        Duration::from_mins(15),
         wait_callback(listener, &attempt, input),
     )
     .await

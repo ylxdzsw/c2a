@@ -14,6 +14,8 @@ provider.
 
 ## Build and install
 
+Requires Rust 1.100 or newer and the OpenSSL development libraries.
+
 ```bash
 cargo build --release
 install -Dm755 target/release/c2a /usr/bin/c2a

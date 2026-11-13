@@ -1,10 +1,7 @@
 use std::{
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
-    os::unix::{
-        fs::{OpenOptionsExt, PermissionsExt},
-        io::AsRawFd,
-    },
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
 };
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -115,25 +112,25 @@ impl CredentialLock {
 
 pub fn load_codex(paths: &Paths) -> Result<Option<CodexCredentials>> {
     let mut file = open(paths, Provider::Codex)?;
-    flock(&file, libc::LOCK_SH)?;
+    file.lock_shared()?;
     let result = validate_codex(read_json(&mut file)?);
-    flock(&file, libc::LOCK_UN)?;
+    file.unlock()?;
     result
 }
 
 pub fn load_copilot(paths: &Paths) -> Result<Option<CopilotCredentials>> {
     let mut file = open(paths, Provider::Copilot)?;
-    flock(&file, libc::LOCK_SH)?;
+    file.lock_shared()?;
     let result = validate_copilot(read_json(&mut file)?);
-    flock(&file, libc::LOCK_UN)?;
+    file.unlock()?;
     result
 }
 
 pub fn load_chatgpt(paths: &Paths) -> Result<Option<ChatgptState>> {
     let mut file = open(paths, Provider::Chatgpt)?;
-    flock(&file, libc::LOCK_SH)?;
+    file.lock_shared()?;
     let result = validate_chatgpt(read_chatgpt(&mut file)?);
-    flock(&file, libc::LOCK_UN)?;
+    file.unlock()?;
     result
 }
 
@@ -154,7 +151,7 @@ pub fn clear(paths: &Paths, provider: Provider) -> Result<()> {
 
 pub fn lock(paths: &Paths, provider: Provider) -> Result<CredentialLock> {
     let file = open(paths, provider)?;
-    flock(&file, libc::LOCK_EX)?;
+    file.lock()?;
     Ok(CredentialLock { file, provider })
 }
 
@@ -182,13 +179,6 @@ fn open(paths: &Paths, provider: Provider) -> Result<File> {
     };
     check_file(&file, path, 0o600)?;
     Ok(file)
-}
-
-fn flock(file: &File, operation: libc::c_int) -> Result<()> {
-    if unsafe { libc::flock(file.as_raw_fd(), operation) } != 0 {
-        return Err(Error::Io(std::io::Error::last_os_error()));
-    }
-    Ok(())
 }
 
 fn read_json<T: DeserializeOwned>(file: &mut File) -> Result<Option<T>> {

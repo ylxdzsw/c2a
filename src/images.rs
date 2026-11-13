@@ -26,7 +26,7 @@ use crate::{
 
 pub const BODY_LIMIT: usize = 64 * 1024 * 1024;
 const RESPONSE_LIMIT: usize = 64 * 1024 * 1024;
-const DEADLINE: Duration = Duration::from_secs(600);
+const DEADLINE: Duration = Duration::from_mins(10);
 const MAX_EDIT_IMAGES: usize = 5;
 
 // Derived structs also accept JSON arrays. Require objects without building a

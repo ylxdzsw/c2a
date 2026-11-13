@@ -260,7 +260,7 @@ The checked-in template units are installed system-wide, run c2a as root from
 
 ## Development Workflow
 
-Use the minimum toolchain declared in `Cargo.toml`: Rust `1.89` or newer, Rust
+Use the minimum toolchain declared in `Cargo.toml`: Rust `1.100` or newer, Rust
 2024 edition, and Linux. Keep dependencies within the existing manifest and
 avoid adding frameworks, provider traits, configuration layers, or logging
 abstractions without a scope change.

@@ -25,7 +25,7 @@ const ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
 const USER_URL: &str = "https://api.github.com/user";
 const DISCOVERY_URL: &str = "https://api.github.com/copilot_internal/user";
 const REFRESH_MARGIN: i64 = 300;
-const LOGIN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const LOGIN_TIMEOUT: Duration = Duration::from_mins(15);
 
 #[derive(Debug, Deserialize)]
 struct DeviceCode {

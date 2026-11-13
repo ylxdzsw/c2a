@@ -106,6 +106,41 @@ fn credentials_are_private_minimal_and_provider_specific() {
 }
 
 #[test]
+fn credential_lock_keeps_the_inode_locked_until_drop() {
+    let root = temp_dir();
+    let paths = paths(root.clone());
+    let mut lock = storage::lock(&paths, provider::Provider::Codex).unwrap();
+    let other = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&paths.codex)
+        .unwrap();
+    let inode = other.metadata().unwrap().ino();
+    std::assert_matches!(other.try_lock(), Err(fs::TryLockError::WouldBlock));
+    std::assert_matches!(other.try_lock_shared(), Err(fs::TryLockError::WouldBlock));
+
+    lock.store(&CodexCredentials {
+        version: 1,
+        access_token: "access".into(),
+        refresh_token: "refresh".into(),
+    })
+    .unwrap();
+    assert_eq!(fs::metadata(&paths.codex).unwrap().ino(), inode);
+    std::assert_matches!(other.try_lock_shared(), Err(fs::TryLockError::WouldBlock));
+    drop(lock);
+
+    other.try_lock_shared().unwrap();
+    assert_eq!(
+        storage::load_codex(&paths).unwrap().unwrap().access_token,
+        "access"
+    );
+    other.unlock().unwrap();
+    other.try_lock().unwrap();
+    other.unlock().unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn quota_commands_audit_failures_but_not_chatgpt_usage_links() {
     let root = temp_dir();
     for provider in ["codex", "copilot"] {

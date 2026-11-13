@@ -24,7 +24,7 @@ pub const SESSION_ID_HEADER: &str = "session-id";
 pub const ROUTING_HINT_HEADER: &str = "x-codex-routing-hint";
 
 const RESPONSE_LIMIT: usize = 64 * 1024;
-const LOGIN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const LOGIN_TIMEOUT: Duration = Duration::from_mins(15);
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Quota {

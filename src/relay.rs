@@ -1,6 +1,7 @@
 use std::{
     convert::Infallible,
     future::{Future, poll_fn},
+    pin::pin,
     sync::Arc,
     task::Poll,
     time::Duration,
@@ -29,7 +30,7 @@ use crate::{
 
 pub(crate) const ERROR_LIMIT: usize = 64 * 1024;
 const ERROR_DETAIL_LIMIT: usize = 1024;
-const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_mins(10);
 
 pub type Body = BoxBody<Bytes, Infallible>;
 
@@ -486,8 +487,8 @@ async fn next_or_shutdown(
     if *shutdown.borrow() {
         return Next::Shutdown;
     }
-    let mut changed = Box::pin(shutdown.changed());
-    let mut chunk = Box::pin(response.chunk());
+    let mut changed = pin!(shutdown.changed());
+    let mut chunk = pin!(response.chunk());
     let race = poll_fn(|context| {
         if changed.as_mut().poll(context).is_ready() {
             return Poll::Ready(Next::Shutdown);

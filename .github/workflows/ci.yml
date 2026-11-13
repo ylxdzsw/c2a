@@ -26,6 +26,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Select Rust toolchain
+        run: |
+          rustup toolchain install 1.100.0 --profile minimal --component clippy,rustfmt
+          rustup override set 1.100.0
+
       - name: Check formatting
         run: cargo fmt --check
 
