@@ -4,10 +4,7 @@ use std::{
     fs, io,
     os::fd::{FromRawFd, RawFd},
     path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
     time::Duration,
 };
 
@@ -71,13 +68,20 @@ pub async fn serve(relay: Relay, socket: Option<PathBuf>) -> Result<()> {
     let semaphore = Arc::new(Semaphore::new(16));
     let relay = Arc::new(relay);
     let mut tasks = JoinSet::new();
-    let stopping = Arc::new(AtomicBool::new(false));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    install_signal_tasks(stopping.clone())?;
-    while !stopping.load(Ordering::Acquire) {
-        reap_finished(&mut tasks);
-        match tokio::time::timeout(Duration::from_millis(250), listener.accept()).await {
-            Ok(Ok((stream, _))) => {
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    loop {
+        tokio::select! {
+            _ = term.recv() => break,
+            _ = interrupt.recv() => break,
+            result = tasks.join_next(), if !tasks.is_empty() => {
+                if let Some(Err(error)) = result {
+                    eprintln!("c2a: connection task failed: {error}");
+                }
+            }
+            result = listener.accept() => {
+                let (stream, _) = result?;
                 let relay = relay.clone();
                 let semaphore = semaphore.clone();
                 let shutdown = shutdown_rx.clone();
@@ -93,8 +97,6 @@ pub async fn serve(relay: Relay, socket: Option<PathBuf>) -> Result<()> {
                     }
                 });
             }
-            Ok(Err(error)) => return Err(error.into()),
-            Err(_) => {}
         }
     }
     let wait = async { while tasks.join_next().await.is_some() {} };
@@ -356,14 +358,6 @@ fn validate_body(
     })
 }
 
-fn reap_finished(tasks: &mut JoinSet<()>) {
-    while let Some(result) = tasks.try_join_next() {
-        if let Err(error) = result {
-            eprintln!("c2a: connection task failed: {error}");
-        }
-    }
-}
-
 fn json_error_with_id(status: StatusCode, message: &str, id: &str) -> Response<Body> {
     let bytes = serde_json::to_vec(&ApiError {
         error: ApiErrorBody {
@@ -454,20 +448,6 @@ fn validate_fd(fd: RawFd) -> Result<()> {
     {
         return Err(Error::message("fd 3 is not listening"));
     }
-    Ok(())
-}
-
-fn install_signal_tasks(stopping: Arc<AtomicBool>) -> io::Result<()> {
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let term_stopping = stopping.clone();
-    tokio::spawn(async move {
-        term.recv().await;
-        term_stopping.store(true, Ordering::Release);
-    });
-    tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
-        stopping.store(true, Ordering::Release);
-    });
     Ok(())
 }
 

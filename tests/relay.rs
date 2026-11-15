@@ -106,6 +106,56 @@ fn status(response: &[u8]) -> u16 {
         .unwrap()
 }
 
+#[test]
+fn signals_stop_idle_servers_and_drain_connections() {
+    for signal in [libc::SIGINT, libc::SIGTERM] {
+        for drain in [false, true] {
+            let mut server = Server::start("copilot");
+            assert_eq!(
+                status(&server.request(
+                    b"GET /other HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+                )),
+                404
+            );
+            let mut stream = drain.then(|| {
+                let mut stream = UnixStream::connect(&server.socket).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                stream
+                    .write_all(b"GET /other HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n")
+                    .unwrap();
+                stream
+            });
+            if drain {
+                thread::sleep(Duration::from_millis(50));
+            }
+            assert_eq!(unsafe { libc::kill(server.child.id() as i32, signal) }, 0);
+            if let Some(stream) = stream.as_mut() {
+                thread::sleep(Duration::from_millis(50));
+                assert!(server.child.try_wait().unwrap().is_none());
+                stream.write_all(b"\r\n").unwrap();
+                let mut response = Vec::new();
+                stream.read_to_end(&mut response).unwrap();
+                assert_eq!(status(&response), 404);
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(status) = server.child.try_wait().unwrap() {
+                    assert!(status.success());
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "server did not stop after signal"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(!server.socket.exists());
+        }
+    }
+}
+
 fn assert_audit_record(
     record: &serde_json::Value,
     operation: &str,
