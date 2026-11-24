@@ -19,6 +19,10 @@ use crate::{
 // downstream User-Agent and originator headers without defaults.
 pub const CLIENT_ID: &str = "Ov23li8tweQw6odWQebz";
 pub const API_VERSION: &str = "2026-06-01";
+// Copilot advertises its OpenAI routes without /v1 (OpenCode's
+// packages/core/src/github-copilot/models.ts uses the discovered origin as-is).
+pub const RESPONSES_PATH: &str = "/responses";
+pub const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 
 const DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
 const ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";

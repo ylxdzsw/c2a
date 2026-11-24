@@ -83,6 +83,33 @@ fn sse_event_timing_uses_the_chunk_that_completes_it() {
 }
 
 #[test]
+fn chat_finish_reason_not_done_sets_terminal_outcome() {
+    for (reason, outcome) in [
+        (None, None),
+        (Some("stop"), Some("completed")),
+        (Some("length"), Some("incomplete")),
+        (Some("network_error"), Some("failed")),
+    ] {
+        let mut observer = audit::SseObserver::chat_completions();
+        observer.feed_at(
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_opaque\":\"not-a-delta\"}}]}\n\n",
+            2.0,
+        );
+        assert_eq!(observer.observation.first_output_ms, None);
+        let event = serde_json::json!({
+            "choices": [{"index": 0, "delta": {"content": "text"}, "finish_reason": reason}]
+        });
+        observer.feed_at(format!("data: {event}\n\n").as_bytes(), 3.0);
+        observer.feed_at(b"data: [DONE]\n\n", 4.0);
+        observer.finish();
+        assert!(!observer.failed());
+        assert_eq!(observer.observation.first_text_ms, Some(3.0));
+        assert_eq!(observer.observation.outcome.as_deref(), outcome);
+        assert_eq!(observer.observation.terminal_ms, reason.map(|_| 3.0));
+    }
+}
+
+#[test]
 fn lifecycle_and_empty_deltas_do_not_count_as_output() {
     let mut observer = audit::SseObserver::new();
     for event in [

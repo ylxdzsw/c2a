@@ -242,9 +242,38 @@ pub struct Observation {
     pub terminal: bool,
 }
 
+impl Observation {
+    fn observe_model_and_tier(&mut self, value: &Value) {
+        if let Some(model) = nonempty_str(&value["model"]) {
+            self.response_model = Some(model.to_owned());
+        }
+        if let Some(tier) = nonempty_str(&value["service_tier"]) {
+            self.response_service_tier = Some(tier.to_owned());
+        }
+    }
+
+    fn mark_terminal(&mut self, outcome: &str, elapsed_ms: f64) {
+        self.outcome = Some(outcome.into());
+        self.terminal_ms.get_or_insert(elapsed_ms);
+        self.terminal = true;
+    }
+
+    fn mark_output(&mut self, kind: &str, is_text: bool, elapsed_ms: f64) {
+        if self.first_output_ms.is_none() {
+            self.first_output_ms = Some(elapsed_ms);
+            self.first_output_kind = Some(kind.to_owned());
+        }
+        self.last_output_ms = Some(elapsed_ms);
+        if is_text {
+            self.first_text_ms.get_or_insert(elapsed_ms);
+        }
+    }
+}
+
 pub struct SseObserver {
     buffer: Vec<u8>,
     failed: bool,
+    chat_completions: bool,
     pub observation: Observation,
 }
 
@@ -253,7 +282,15 @@ impl SseObserver {
         Self {
             buffer: Vec::new(),
             failed: false,
+            chat_completions: false,
             observation: Observation::default(),
+        }
+    }
+
+    pub fn chat_completions() -> Self {
+        Self {
+            chat_completions: true,
+            ..Self::new()
         }
     }
 
@@ -309,25 +346,16 @@ impl SseObserver {
             self.failed = true;
             return;
         };
-        self.observe(&value, elapsed_ms);
+        if self.chat_completions {
+            self.observe_chat(&value, elapsed_ms);
+        } else {
+            self.observe_responses(&value, elapsed_ms);
+        }
     }
 
-    fn observe(&mut self, value: &Value, elapsed_ms: f64) {
+    fn observe_responses(&mut self, value: &Value, elapsed_ms: f64) {
         let response = value.get("response").unwrap_or(value);
-        if let Some(model) = response
-            .get("model")
-            .and_then(Value::as_str)
-            .filter(|model| !model.is_empty())
-        {
-            self.observation.response_model = Some(model.to_owned());
-        }
-        if let Some(service_tier) = response
-            .get("service_tier")
-            .and_then(Value::as_str)
-            .filter(|service_tier| !service_tier.is_empty())
-        {
-            self.observation.response_service_tier = Some(service_tier.to_owned());
-        }
+        self.observation.observe_model_and_tier(response);
         if let Some(effort) = response
             .pointer("/reasoning/effort")
             .and_then(Value::as_str)
@@ -343,26 +371,13 @@ impl SseObserver {
             self.observation.response_id = Some(id.to_owned());
         }
         let event_type = value.get("type").and_then(Value::as_str);
-        let terminal = match event_type {
-            Some("response.completed") => {
-                self.observation.outcome = Some("completed".into());
-                true
-            }
-            Some("response.incomplete") => {
-                self.observation.outcome = Some("incomplete".into());
-                true
-            }
-            Some("response.failed") | Some("error") => {
-                self.observation.outcome = Some("failed".into());
-                true
-            }
-            _ => false,
-        };
-        if terminal {
-            if !self.observation.terminal {
-                self.observation.terminal_ms = Some(elapsed_ms);
-            }
-            self.observation.terminal = true;
+        if let Some(outcome) = match event_type {
+            Some("response.completed") => Some("completed"),
+            Some("response.incomplete") => Some("incomplete"),
+            Some("response.failed" | "error") => Some("failed"),
+            _ => None,
+        } {
+            self.observation.mark_terminal(outcome, elapsed_ms);
         }
         if let Some(usage) = response.get("usage").or_else(|| value.get("usage")) {
             set_u64(
@@ -406,26 +421,105 @@ impl SseObserver {
             }
             _ => (None, false),
         };
-        if let Some(output_kind) = output_kind.filter(|_| {
-            value
-                .get("delta")
-                .and_then(Value::as_str)
-                .is_some_and(|delta| !delta.is_empty())
-        }) {
-            if self.observation.first_output_ms.is_none() {
-                self.observation.first_output_ms = Some(elapsed_ms);
-                self.observation.first_output_kind = Some(output_kind.to_owned());
-            }
-            self.observation.last_output_ms = Some(elapsed_ms);
-            if is_text && self.observation.first_text_ms.is_none() {
-                self.observation.first_text_ms = Some(elapsed_ms);
-            }
+        if let Some(output_kind) = output_kind.filter(|_| nonempty_str(&value["delta"]).is_some()) {
+            self.observation
+                .mark_output(output_kind, is_text, elapsed_ms);
+        }
+    }
+
+    fn observe_chat(&mut self, value: &Value, elapsed_ms: f64) {
+        let observation = &mut self.observation;
+        observation.observe_model_and_tier(value);
+        if let Some(id) = sanitize_id(value["id"].as_str()) {
+            observation.response_id = Some(id);
+        }
+        if let Some(effort) = nonempty_str(&value["reasoning_effort"]) {
+            observation.response_reasoning_effort = Some(effort.to_owned());
+        }
+        if let Some(usage) = value.get("usage") {
+            set_u64(&mut observation.input_tokens, usage.get("prompt_tokens"));
+            set_u64(
+                &mut observation.output_tokens,
+                usage.get("completion_tokens"),
+            );
+            set_u64(&mut observation.total_tokens, usage.get("total_tokens"));
+            set_u64(
+                &mut observation.cached_input_tokens,
+                usage.pointer("/prompt_tokens_details/cached_tokens"),
+            );
+            // Copilot can report reasoning_tokens directly under usage.
+            set_u64(
+                &mut observation.reasoning_output_tokens,
+                usage
+                    .pointer("/completion_tokens_details/reasoning_tokens")
+                    .filter(|value| value.is_u64())
+                    .or_else(|| usage.get("reasoning_tokens")),
+            );
+        }
+
+        if !value["error"].is_null() || value["type"].as_str() == Some("error") {
+            observation.mark_terminal("failed", elapsed_ms);
+            return;
+        }
+        let Some(choice) = value["choices"].as_array().and_then(|choices| {
+            choices.iter().find(|choice| {
+                choice
+                    .get("index")
+                    .is_none_or(|index| index.as_u64() == Some(0))
+            })
+        }) else {
+            return;
+        };
+        let delta = &choice["delta"];
+        if ["reasoning_text", "reasoning_content", "reasoning"]
+            .into_iter()
+            .any(|field| nonempty_str(&delta[field]).is_some())
+        {
+            observation.mark_output("reasoning_text", false, elapsed_ms);
+        }
+        if nonempty_str(&delta["content"]).is_some() {
+            observation.mark_output("output_text", true, elapsed_ms);
+        }
+        if nonempty_str(&delta["refusal"]).is_some() {
+            observation.mark_output("refusal", true, elapsed_ms);
+        }
+        if delta["tool_calls"].as_array().is_some_and(|calls| {
+            calls
+                .iter()
+                .any(|call| nonempty_str(&call["function"]["arguments"]).is_some())
+        }) || nonempty_str(&delta["function_call"]["arguments"]).is_some()
+        {
+            observation.mark_output("function_call_arguments", false, elapsed_ms);
+        }
+        if !observation.terminal
+            && let Some(reason) = nonempty_str(&choice["finish_reason"])
+        {
+            let outcome = match reason {
+                "stop" | "tool_calls" | "function_call" => "completed",
+                "network_error" | "error" => "failed",
+                _ => "incomplete",
+            };
+            observation.mark_terminal(outcome, elapsed_ms);
         }
     }
 
     pub fn failed(&self) -> bool {
         self.failed
     }
+}
+
+fn nonempty_str(value: &Value) -> Option<&str> {
+    value.as_str().filter(|text| !text.is_empty())
+}
+
+pub(crate) fn sanitize_id(value: Option<&str>) -> Option<String> {
+    value
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 256
+                && value.bytes().all(|byte| byte.is_ascii_graphic())
+        })
+        .map(str::to_owned)
 }
 
 fn set_u64(slot: &mut Option<u64>, value: Option<&Value>) {

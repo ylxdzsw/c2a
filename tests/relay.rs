@@ -359,6 +359,51 @@ fn validates_native_streaming_body() {
 }
 
 #[test]
+fn chat_completions_is_copilot_only_and_requires_native_streaming_json() {
+    const PATH: &str = "/v1/chat/completions";
+    for provider in ["codex", "chatgpt"] {
+        let server = Server::start(provider);
+        assert_eq!(status(&server.post(PATH, b"{}", "application/json")), 404);
+    }
+    let server = Server::start("copilot");
+    assert_eq!(
+        status(&server.request(
+            b"GET /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        )),
+        405
+    );
+    assert_eq!(status(&server.post(PATH, b"{}", "text/plain")), 415);
+    let invalid = [
+        br#"[]"#.as_slice(),
+        br#"{"model":"", "messages":[], "stream":true}"#,
+        br#"{"model":"m", "stream":true}"#,
+        br#"{"model":"m", "messages":{}, "stream":true}"#,
+        br#"{"model":"m", "messages":[], "stream":false}"#,
+    ];
+    for body in invalid {
+        assert_eq!(status(&server.post(PATH, body, "application/json")), 400);
+    }
+    assert_eq!(status(&server.request(b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 16777217\r\nConnection: close\r\n\r\n")), 413);
+    let body = br#"{ "model":"gemini-4-hydrogen", "messages":[{"role":"user","content":"not audited"}], "stream":true, "reasoning_effort":"low", "unknown_option":42 }"#;
+    // Valid native JSON reaches credential acquisition; isolated empty state prevents network access.
+    assert_eq!(status(&server.post(PATH, body, "application/json")), 502);
+
+    let records = server.audit_records(invalid.len() + 4);
+    assert!(
+        records
+            .iter()
+            .all(|record| record["operation"] == "chat.completions")
+    );
+    let record = &records[records.len() - 1];
+    assert_eq!(record["provider"], "copilot");
+    assert_eq!(record["model"], "gemini-4-hydrogen");
+    assert_eq!(record["requested_reasoning_effort"], "low");
+    assert_eq!(record["request_bytes"], body.len());
+    assert_eq!(record["upstream_attempts"], 0);
+    assert!(!record.to_string().contains("not audited"));
+}
+
+#[test]
 fn image_routes_are_codex_only_and_require_native_json() {
     let codex = Server::start("codex");
     let copilot = Server::start("copilot");

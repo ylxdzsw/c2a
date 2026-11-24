@@ -2,19 +2,19 @@
 
 ## Purpose
 
-`c2a` is a Linux-only Rust service that exposes the OpenAI Responses API over
-local Unix-domain sockets and relays native streaming requests to either the
-ChatGPT Codex or GitHub Copilot subscription backend. It owns one login per
-provider and accepts:
+`c2a` is a Linux-only Rust service that exposes native OpenAI APIs over local
+Unix-domain sockets. It owns one login per provider and accepts:
 
 ```text
 POST /v1/responses
+POST /v1/chat/completions    (Copilot only)
 POST /v1/images/generations  (Codex only)
 POST /v1/images/edits        (Codex only)
 ```
 
-Responses requests must be JSON, contain a nonempty `model`, and set `stream`
-to the boolean `true`. Images use native non-streaming JSON (see below).
+Streaming requests must be JSON, contain a nonempty `model`, and set `stream`
+to the boolean `true`. Chat Completions additionally requires a `messages`
+array. Images use native non-streaming JSON (see below).
 c2a does not translate models, rewrite request bodies, expose
 TCP, provide API keys, or maintain an account pool.
 
@@ -61,20 +61,25 @@ All application modules are intentionally flat under `src/`.
 The original local request bytes are retained only for the duration of the
 relay and sent unchanged upstream. c2a validates a parsed JSON representation
 but does not serialize it back into a new request. Only downstream `User-Agent`
-and `originator` headers are forwarded on all Responses and Images routes;
+and `originator` headers are forwarded on inference routes;
 absent values remain absent, with no c2a identity defaults. These headers are
 not audited. Login, refresh, discovery, and status requests retain c2a's own
 User-Agent; ChatGPT application registration is unchanged. Codex does not send
 a `version` header or the Responses Lite header. Copilot sends the current
 GitHub API version but no borrowed editor, plugin, integration, initiator,
 intent, vision, or request-ID
-identity headers. Successful Responses upstreams may omit `Content-Type`, in
+identity headers. Successful streaming upstreams may omit `Content-Type`, in
 which case c2a synthesizes `text/event-stream`; an explicitly wrong content
 type is rejected. c2a copies only content type, cache control, and a sanitized
 upstream request ID. Both `x-request-id` and `x-oai-request-id` are recognized
 upstream and exposed locally as `x-request-id`. Upstream HTTP errors retain
 their status and may additionally copy `Retry-After`; c2a-generated relay
 failures use `502 Bad Gateway`.
+
+Copilot Chat Completions uses `/chat/completions` on the discovered origin and
+shares the Responses streaming path and limits. An observational SSE parser
+uses Chat choice finish reasons, not `[DONE]`, and observes any trailing usage.
+It never retains reasoning state or tool arguments; clients own replay.
 
 ### Native Images
 

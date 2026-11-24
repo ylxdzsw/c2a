@@ -205,8 +205,8 @@ async fn handle_inner(
         ));
     }
     let mut permits = Vec::new();
-    for semaphore in std::iter::once(semaphore)
-        .chain((operation != Operation::Responses).then(|| relay.image_slots.clone()))
+    for semaphore in
+        std::iter::once(semaphore).chain(operation.is_image().then(|| relay.image_slots.clone()))
     {
         match semaphore.try_acquire_owned() {
             Ok(permit) => permits.push(permit),
@@ -219,10 +219,10 @@ async fn handle_inner(
             }
         }
     }
-    let limit = if operation == Operation::Responses {
-        BODY_LIMIT
-    } else {
+    let limit = if operation.is_image() {
         images::BODY_LIMIT
+    } else {
+        BODY_LIMIT
     };
     let too_large = || {
         json_error_with_id(
@@ -271,10 +271,10 @@ async fn handle_inner(
         // Record only the collected length; request payloads are never retained.
         audit.record.request_bytes = bytes.len() as u64;
     }
-    let validation = if operation == Operation::Responses {
-        validate_body(&bytes, relay.provider())
-    } else {
+    let validation = if operation.is_image() {
         images::validate(&bytes, operation)
+    } else {
+        validate_streaming_body(&bytes, operation, relay.provider())
     };
     let mut metadata = match validation {
         Ok(metadata) => metadata,
@@ -313,8 +313,9 @@ fn forwarded_identity_headers(headers: &HeaderMap) -> HeaderMap {
     forwarded
 }
 
-fn validate_body(
+fn validate_streaming_body(
     bytes: &[u8],
+    operation: Operation,
     provider: Provider,
 ) -> std::result::Result<RequestMetadata, &'static str> {
     let value: serde_json::Value =
@@ -330,6 +331,13 @@ fn validate_body(
     if object.get("stream") != Some(&serde_json::Value::Bool(true)) {
         return Err("stream must be true");
     }
+    if operation == Operation::ChatCompletions
+        && !object
+            .get("messages")
+            .is_some_and(serde_json::Value::is_array)
+    {
+        return Err("messages must be an array");
+    }
     if provider == Provider::Chatgpt {
         if object.get("store") != Some(&serde_json::Value::Bool(false)) {
             return Err("ChatGPT plan requests require store: false");
@@ -339,7 +347,7 @@ fn validate_body(
         }
     }
     Ok(RequestMetadata {
-        operation: Operation::Responses,
+        operation,
         model: model.to_owned(),
         identity_headers: HeaderMap::new(),
         prompt_cache_key: object
@@ -351,7 +359,11 @@ fn validate_body(
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned),
         reasoning_effort: value
-            .pointer("/reasoning/effort")
+            .pointer(if operation == Operation::ChatCompletions {
+                "/reasoning_effort"
+            } else {
+                "/reasoning/effort"
+            })
             .and_then(serde_json::Value::as_str)
             .filter(|effort| !effort.is_empty())
             .map(str::to_owned),
@@ -457,7 +469,7 @@ pub fn socket_argument(value: OsString) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{forwarded_identity_headers, validate_body};
+    use super::{Operation, Provider, forwarded_identity_headers, validate_streaming_body};
 
     #[test]
     fn only_identity_headers_are_selected_for_forwarding() {
@@ -486,7 +498,8 @@ mod tests {
     fn validation_does_not_rewrite_request_bytes() {
         let bytes = br#"{ "stream": true, "model": "gpt-5", "prompt_cache_key": "session-1", "service_tier": "priority", "reasoning": {"effort": "high"}, "input": [1, 2] }"#.to_vec();
         let original = bytes.clone();
-        let metadata = validate_body(&bytes, crate::provider::Provider::Codex).unwrap();
+        let metadata =
+            validate_streaming_body(&bytes, Operation::Responses, Provider::Codex).unwrap();
         assert_eq!(metadata.model, "gpt-5");
         assert_eq!(metadata.prompt_cache_key.as_deref(), Some("session-1"));
         assert_eq!(metadata.service_tier.as_deref(), Some("priority"));
@@ -505,9 +518,10 @@ mod tests {
             serde_json::json!({"effort": "future-effort"}),
         ] {
             let request = serde_json::json!({"stream": true, "model": "m", "reasoning": reasoning});
-            let metadata = validate_body(
+            let metadata = validate_streaming_body(
                 &serde_json::to_vec(&request).unwrap(),
-                crate::provider::Provider::Codex,
+                Operation::Responses,
+                Provider::Codex,
             )
             .unwrap();
             assert_eq!(
@@ -517,9 +531,10 @@ mod tests {
                     .filter(|effort| !effort.is_empty())
             );
         }
-        let metadata = validate_body(
+        let metadata = validate_streaming_body(
             br#"{"stream":true,"model":"m"}"#,
-            crate::provider::Provider::Codex,
+            Operation::Responses,
+            Provider::Codex,
         )
         .unwrap();
         assert!(metadata.reasoning_effort.is_none());

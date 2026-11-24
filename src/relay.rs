@@ -15,6 +15,7 @@ use hyper::{
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
 
+pub(crate) use crate::audit::sanitize_id as sanitize_request_id;
 use crate::{
     audit::{Audit, AuditRecord, RequestAudit},
     chatgpt,
@@ -37,6 +38,7 @@ pub type Body = BoxBody<Bytes, Infallible>;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Operation {
     Responses,
+    ChatCompletions,
     ImageGenerations,
     ImageEdits,
 }
@@ -45,14 +47,20 @@ impl Operation {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Responses => "responses",
+            Self::ChatCompletions => "chat.completions",
             Self::ImageGenerations => "images.generations",
             Self::ImageEdits => "images.edits",
         }
     }
 
-    fn upstream(self) -> &'static str {
+    pub fn is_image(self) -> bool {
+        matches!(self, Self::ImageGenerations | Self::ImageEdits)
+    }
+
+    fn codex_upstream(self) -> &'static str {
         match self {
             Self::Responses => device::UPSTREAM,
+            Self::ChatCompletions => unreachable!("Chat Completions is Copilot-only"),
             Self::ImageGenerations => device::IMAGE_GENERATIONS,
             Self::ImageEdits => device::IMAGE_EDITS,
         }
@@ -112,6 +120,7 @@ impl Relay {
     pub fn operation(&self, path: &str) -> Option<Operation> {
         match (self.provider, path) {
             (_, "/v1/responses") => Some(Operation::Responses),
+            (Provider::Copilot, "/v1/chat/completions") => Some(Operation::ChatCompletions),
             (Provider::Codex, "/v1/images/generations") => Some(Operation::ImageGenerations),
             (Provider::Codex, "/v1/images/edits") => Some(Operation::ImageEdits),
             _ => None,
@@ -141,7 +150,7 @@ impl Relay {
         audit.record.requested_service_tier = metadata.service_tier.clone();
         audit.record.requested_reasoning_effort = metadata.reasoning_effort.clone();
         let relay = self.clone();
-        if metadata.operation != Operation::Responses {
+        if metadata.operation.is_image() {
             return images::start(audit, permits, shutdown, move |record| {
                 Box::pin(async move { relay.send_authenticated(&body, &metadata, record).await })
             })
@@ -151,7 +160,7 @@ impl Relay {
         tokio::spawn(async move {
             let _permits = permits;
             let result = {
-                let work = relay.responses(&body, &metadata, &mut audit);
+                let work = relay.streaming_response(&body, &metadata, &mut audit);
                 if *shutdown.borrow() {
                     Err("shutdown")
                 } else {
@@ -170,7 +179,14 @@ impl Relay {
                         audit.record.local_http_status = None;
                         audit.record.outcome = "client_disconnect".into();
                     } else if let Some((mut upstream, mut sender)) = stream {
-                        observe_stream(&mut upstream, &mut sender, &mut audit, &mut shutdown).await;
+                        observe_stream(
+                            metadata.operation,
+                            &mut upstream,
+                            &mut sender,
+                            &mut audit,
+                            &mut shutdown,
+                        )
+                        .await;
                     }
                 }
                 Ok(Err(error)) => {
@@ -197,7 +213,7 @@ impl Relay {
             .map_err(|_| Error::message("relay task stopped"))?
     }
 
-    async fn responses(
+    async fn streaming_response(
         &self,
         body: &Bytes,
         metadata: &RequestMetadata,
@@ -388,12 +404,17 @@ pub(crate) fn record_upstream(response: &reqwest::Response, record: &mut AuditRe
 }
 
 async fn observe_stream(
+    operation: Operation,
     response: &mut reqwest::Response,
     sender: &mut http_body_util::channel::Sender<Bytes>,
     audit: &mut RequestAudit,
     shutdown: &mut watch::Receiver<bool>,
 ) {
-    let mut observer = crate::sse::Observer::new();
+    let mut observer = match operation {
+        Operation::Responses => crate::sse::Observer::new(),
+        Operation::ChatCompletions => crate::sse::Observer::chat_completions(),
+        _ => unreachable!("Images use a JSON relay"),
+    };
     let mut outcome = None;
     loop {
         match next_or_shutdown(response, shutdown).await {
@@ -534,7 +555,7 @@ fn codex_request(
     claims: &Claims,
 ) -> reqwest::RequestBuilder {
     let mut request = client
-        .post(metadata.operation.upstream())
+        .post(metadata.operation.codex_upstream())
         .bearer_auth(&credentials.access_token)
         .header("Chatgpt-Account-Id", &claims.account_id)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -575,8 +596,13 @@ fn copilot_request(
     endpoint: &str,
     access_token: &str,
 ) -> reqwest::RequestBuilder {
+    let path = match metadata.operation {
+        Operation::Responses => copilot::RESPONSES_PATH,
+        Operation::ChatCompletions => copilot::CHAT_COMPLETIONS_PATH,
+        _ => unreachable!("Images are Codex-only"),
+    };
     client
-        .post(format!("{endpoint}/responses"))
+        .post(format!("{endpoint}{path}"))
         .bearer_auth(access_token)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .header(reqwest::header::ACCEPT, "text/event-stream")
@@ -625,16 +651,6 @@ fn accepts_content_type(content_type: Option<&reqwest::header::HeaderValue>) -> 
                 .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream"))
         })
         || content_type.is_none()
-}
-
-pub(crate) fn sanitize_request_id(value: Option<&str>) -> Option<String> {
-    value
-        .filter(|value| {
-            !value.is_empty()
-                && value.len() <= 256
-                && value.bytes().all(|byte| byte.is_ascii_graphic())
-        })
-        .map(str::to_owned)
 }
 
 pub(crate) fn upstream_error_response(
@@ -852,7 +868,7 @@ mod tests {
             )
             .build()
             .unwrap();
-            assert_eq!(request.url().as_str(), operation.upstream());
+            assert_eq!(request.url().as_str(), operation.codex_upstream());
             assert_eq!(request.body().unwrap().as_bytes().unwrap(), bytes);
             assert_eq!(
                 request.headers()[reqwest::header::ACCEPT],
@@ -952,37 +968,48 @@ mod tests {
 
     #[test]
     fn copilot_request_uses_versioned_api_without_default_identity() {
-        let request = copilot_request(
-            &reqwest::Client::new(),
-            br#"{"model":"gpt-5.6-luna","stream":true}"#,
-            &metadata(),
-            "https://api.individual.githubcopilot.com",
-            "access",
-        )
-        .build()
-        .unwrap();
-
-        assert_eq!(
-            request.url().as_str(),
-            "https://api.individual.githubcopilot.com/responses"
-        );
-        assert!(request.headers().get("user-agent").is_none());
-        assert_eq!(
-            request.headers()["X-GitHub-Api-Version"],
-            copilot::API_VERSION
-        );
-        for name in [
-            "OpenAI-Intent",
-            "X-Initiator",
-            "X-Interaction-Type",
-            "Copilot-Vision-Request",
-            "Editor-Version",
-            "Editor-Plugin-Version",
-            "Copilot-Integration-Id",
-            "X-Request-Id",
-            "originator",
+        let client = reqwest::Client::new();
+        for (operation, path, bytes) in [
+            (
+                Operation::Responses,
+                "/responses",
+                br#"{"model":"gpt-5.6-luna","stream":true}"#.as_slice(),
+            ),
+            (
+                Operation::ChatCompletions,
+                "/chat/completions",
+                br#"{ "model": "gemini-4-hydrogen", "messages": [], "stream": true, "stream_options": {"include_usage":true} }"#,
+            ),
         ] {
-            assert!(request.headers().get(name).is_none(), "{name}");
+            let request = copilot_request(
+                &client,
+                bytes,
+                &RequestMetadata { operation, ..metadata() },
+                "https://api.individual.githubcopilot.com",
+                "access",
+            )
+            .build()
+            .unwrap();
+            assert_eq!(request.url().path(), path);
+            assert_eq!(request.url().host_str(), Some("api.individual.githubcopilot.com"));
+            assert_eq!(request.body().unwrap().as_bytes(), Some(bytes));
+            assert_eq!(request.headers()["authorization"], "Bearer access");
+            assert_eq!(request.headers()["accept"], "text/event-stream");
+            assert_eq!(request.headers()["X-GitHub-Api-Version"], copilot::API_VERSION);
+            for name in [
+                "OpenAI-Intent",
+                "X-Initiator",
+                "X-Interaction-Type",
+                "Copilot-Vision-Request",
+                "Editor-Version",
+                "Editor-Plugin-Version",
+                "Copilot-Integration-Id",
+                "X-Request-Id",
+                "originator",
+                "user-agent",
+            ] {
+                assert!(request.headers().get(name).is_none(), "{name}");
+            }
         }
     }
 
@@ -1050,7 +1077,14 @@ mod tests {
         let (mut sender, body) = http_body_util::Channel::new(4);
         audit.record.requested_reasoning_effort = Some("high".into());
         let (_shutdown, mut receiver) = tokio::sync::watch::channel(false);
-        super::observe_stream(&mut upstream, &mut sender, &mut audit, &mut receiver).await;
+        super::observe_stream(
+            Operation::Responses,
+            &mut upstream,
+            &mut sender,
+            &mut audit,
+            &mut receiver,
+        )
+        .await;
         drop(sender);
         assert_eq!(body.collect().await.unwrap().to_bytes(), bytes);
         audit.finish().await;
@@ -1081,6 +1115,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_stream_preserves_bytes_and_audits_trailing_usage_without_payload() {
+        use http_body_util::BodyExt;
+
+        let bytes = concat!(
+            "data: {\"id\":\"chatcmpl-test\",\"model\":\"served-model\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_text\":\"private-thinking\",\"reasoning_opaque\":\"private-opaque\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"private-arguments\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":4,\"total_tokens\":17,\"prompt_tokens_details\":{\"cached_tokens\":0},\"reasoning_tokens\":3}}\n\n",
+            "data: [DONE]\n\n",
+        ).as_bytes().to_vec();
+        let mut upstream: reqwest::Response = hyper::Response::new(bytes.clone()).into();
+        let (path, mut audit) = test_audit();
+        let (mut sender, body) = http_body_util::Channel::new(4);
+        let (_shutdown, mut receiver) = tokio::sync::watch::channel(false);
+        super::observe_stream(
+            Operation::ChatCompletions,
+            &mut upstream,
+            &mut sender,
+            &mut audit,
+            &mut receiver,
+        )
+        .await;
+        drop(sender);
+        assert_eq!(body.collect().await.unwrap().to_bytes(), bytes);
+        audit.finish().await;
+        let line = std::fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["outcome"], "completed");
+        assert_eq!(value["response_id"], "chatcmpl-test");
+        assert_eq!(value["response_model"], "served-model");
+        assert_eq!(value["first_output_kind"], "reasoning_text");
+        assert!(value.get("first_text_ms").is_none());
+        assert_eq!(value["input_tokens"], 10);
+        assert_eq!(value["output_tokens"], 4);
+        assert_eq!(value["total_tokens"], 17);
+        assert_eq!(value["cached_input_tokens"], 0);
+        assert_eq!(value["reasoning_output_tokens"], 3);
+        assert!(!line.contains("private-"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn stream_disconnect_and_bounded_error_reads_retain_statistics() {
         let (path, mut audit) = test_audit();
         let mut response: reqwest::Response = hyper::Response::new(
@@ -1090,7 +1165,14 @@ mod tests {
         let (mut sender, body) = http_body_util::Channel::new(4);
         drop(body);
         let (_shutdown, mut receiver) = tokio::sync::watch::channel(false);
-        super::observe_stream(&mut response, &mut sender, &mut audit, &mut receiver).await;
+        super::observe_stream(
+            Operation::Responses,
+            &mut response,
+            &mut sender,
+            &mut audit,
+            &mut receiver,
+        )
+        .await;
         assert_eq!(audit.record.outcome, "client_disconnect");
         assert!(audit.record.first_output_ms.is_some());
         assert!(audit.record.terminal_ms.is_none());

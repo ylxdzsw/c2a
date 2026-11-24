@@ -2,13 +2,14 @@
 
 `c2a` exposes native OpenAI APIs on local Unix sockets. It relays streaming
 Responses requests to a ChatGPT Codex subscription, a GitHub Copilot
-subscription, or ChatGPT plan usage through Sign in with ChatGPT (SIWC), and
-JSON Images requests to Codex. It is Linux-only and supports one login for each
-provider.
+subscription, or ChatGPT plan usage through Sign in with ChatGPT (SIWC). It
+also relays streaming Chat Completions to Copilot and JSON Images to Codex.
+It is Linux-only and supports one login for each provider.
 
 | Endpoint | Codex | Copilot | ChatGPT (SIWC) |
 | --- | --- | --- | --- |
 | `POST /v1/responses` (`stream: true`) | Yes | Yes | Yes, `store: false` |
+| `POST /v1/chat/completions` (`stream: true`) | No | Yes | No |
 | `POST /v1/images/generations` (JSON) | Yes | No | No |
 | `POST /v1/images/edits` (JSON) | Yes | No | No |
 
@@ -174,7 +175,7 @@ activates `/run/c2a/codex.sock`, `/run/c2a/copilot.sock`, and
 
 ## Configure mu
 
-Percent-encode the absolute socket path in an `http+unix` Responses endpoint.
+Percent-encode the absolute socket path in an `http+unix` endpoint.
 For the system service:
 
 ```jsonc
@@ -195,14 +196,17 @@ For the system service:
           "context_window": 1050000
         }
       }
+    },
+    "c2a-copilot-chat": {
+      "endpoint": "http+unix://%2Frun%2Fc2a%2Fcopilot.sock/v1/chat/completions",
+      "models": { "gemini-4-hydrogen": {} }
     }
   }
 }
 ```
 
-`c2a` does not translate models or request bodies. The configured model name and
-native Responses payload are forwarded unchanged. On all Responses and Images
-routes, downstream `User-Agent` and `originator` headers are forwarded unchanged
+`c2a` does not translate models or request bodies. On all inference routes,
+downstream `User-Agent` and `originator` headers are forwarded unchanged
 when provided and omitted when absent; c2a adds no default application identity.
 No other local request headers are forwarded. Authentication, account selection,
 and provider-required headers remain controlled by c2a. This applies to relayed
@@ -215,6 +219,11 @@ For ChatGPT SIWC, c2a derives `session_id` (underscore) from the same body key;
 it does not add `session-id`, `x-codex-routing-hint`, or `x-client-request-id`.
 An absent or header-unsafe key omits the derived session header on either
 provider without changing the request body.
+
+Copilot Chat Completions accepts JSON with a nonempty `model`, a `messages`
+array, and `stream: true`. It forwards the JSON and SSE bytes unchanged. The
+client is responsible for replaying any reasoning state required for tool
+continuations. Model availability depends on the Copilot account.
 
 ## Generate and edit images
 
@@ -263,8 +272,9 @@ Images requests and success responses are each limited to 64 MiB (including
 base64 and JSON overhead). Two image operations may run at once, within the
 shared limit of 16 active relays. Admission happens before request collection;
 local uploads have a 60-second deadline. Upstream Images operations have a
-10-minute deadline, including the wait for response headers. Responses requests
-retain their 16 MiB body limit and SSE behavior.
+10-minute deadline, including the wait for response headers. Responses and Chat
+Completions have a 16 MiB request body limit and a 10-minute upstream stream
+idle timeout.
 
 Successful Images JSON is buffered and checked for nonempty image data before
 being returned byte-for-byte. No generated files are stored by the service.
@@ -282,10 +292,11 @@ part of the same local request, not a separate audit line. Requests rejected by
 the HTTP parser before the handler runs are not audited. Forced termination or
 a crash can still prevent a final record.
 
-Records identify `provider`, `operation` (`responses`, `images.generations`,
-`images.edits`, `quota`, or `unknown` for an unsupported route), local `request_id`, byte
-counts, timestamps, outcome, and available upstream IDs. Images may include a
-distinct `upstream_imagegen_request_id`, never substituted for `response_id`.
+Records identify `provider`, `operation` (`responses`, `chat.completions`,
+`images.generations`, `images.edits`, `quota`, or `unknown` for an unsupported
+route), local `request_id`, byte counts, timestamps, outcome, and available
+upstream IDs. Images may include a distinct `upstream_imagegen_request_id`,
+never substituted for `response_id`.
 Unknown optional values are omitted, not written as zero or inferred.
 
 ### Quota queries
@@ -327,13 +338,13 @@ refresh traffic is not included in the upstream status or byte counts.
 | --- | --- |
 | `model` | Requested model; empty for requests rejected before successful validation |
 | `response_model` | Last nonempty model ID reported by upstream |
-| `requested_service_tier` | Requested Responses service tier, when supplied |
+| `requested_service_tier` | Requested Responses or Chat Completions service tier, when supplied |
 | `response_service_tier` | Last nonempty tier reported by upstream, independent of the requested tier |
-| `requested_reasoning_effort` | Nonempty Responses `reasoning.effort`, when supplied |
-| `response_reasoning_effort` | Last nonempty `response.reasoning.effort` reported in the Responses stream, independent of the requested effort |
+| `requested_reasoning_effort` | Nonempty Responses `reasoning.effort` or Chat Completions `reasoning_effort`, when supplied |
+| `response_reasoning_effort` | Last nonempty Responses `response.reasoning.effort` or Chat Completions `reasoning_effort` reported in the stream, independent of the requested effort |
 | `input_tokens`, `output_tokens`, `total_tokens` | Upstream usage counts, when reported |
-| `cached_input_tokens` | `usage.input_tokens_details.cached_tokens` |
-| `reasoning_output_tokens` | `usage.output_tokens_details.reasoning_tokens` |
+| `cached_input_tokens` | Responses `usage.input_tokens_details.cached_tokens` or Chat `usage.prompt_tokens_details.cached_tokens` |
+| `reasoning_output_tokens` | Responses `usage.output_tokens_details.reasoning_tokens` or Chat `usage.completion_tokens_details.reasoning_tokens` (falling back to Copilot `usage.reasoning_tokens`) |
 | `upstream_attempts` | Inference HTTP sends started, including failed sends; excludes OAuth, refresh, and discovery requests |
 | `auth_retries` | Credential-recovery retries entered after an upstream 401; a retry may fail before another send, or reuse another request's refreshed credentials |
 | `local_http_status` | Status handed back to the local HTTP handler; absent if cancelled before that handoff |
@@ -350,17 +361,25 @@ reported, but the image backend often omits them. A reported model name is not
 independent proof of which model executed the request. We do not reject or
 rewrite responses based on model or tier differences.
 
-Responses usage and metadata are observed from SSE; Images metadata is extracted
-selectively from JSON without decoding image data. Partial usage events do not
-erase earlier observed counts. A reported zero is retained distinctly from an
-unavailable count. New optional image metadata with an unexpected type is ignored.
-No total or detail count is synthesized from other fields.
+Responses and Chat Completions usage and metadata are observed from SSE; Images
+metadata is extracted selectively from JSON without decoding image data.
+Partial usage events do not erase earlier observed counts. A reported zero is
+retained distinctly from an unavailable count. No count is synthesized from
+other fields. Chat's `input_tokens` and `output_tokens` are the wire's
+`prompt_tokens` and `completion_tokens`; the latter may not include separately
+reported Copilot reasoning tokens.
 
 Outcomes remain `completed`, `incomplete`, `failed`, `upstream_error`,
 `premature_eof`, `client_disconnect`, `shutdown`, and `uninspected`; local
 validation/admission failures use `rejected`. `uninspected` means observation or
 validation failed, not necessarily that forwarding failed. An upstream success
 status alone does not establish successful completion: inspect `outcome` too.
+For Chat, outcome and delta timing describe choice zero (or the first unindexed
+choice). `stop`, `tool_calls`, and `function_call` mark completion; stream errors
+and `network_error` or `error` finishes mark failure. Other finish reasons mark
+the result incomplete. A clean EOF without a finish reason or stream error is
+`premature_eof`, even after `[DONE]`. Usage can arrive after the finish reason
+and is still observed.
 
 ### Timing and throughput
 
@@ -379,7 +398,7 @@ not server-side inference timestamps or client receipt times.
 | `first_output_ms` | First complete, nonempty recognized output delta event |
 | `first_text_ms` | First nonempty output-text or refusal delta, excluding reasoning and tool arguments |
 | `last_output_ms` | Last recognized nonempty output delta |
-| `terminal_ms` | First completed/incomplete/failed/error terminal SSE event |
+| `terminal_ms` | First Responses terminal event or Chat finish reason/stream error |
 | `first_output_kind` | Kind of the first recognized output delta, not its content |
 
 Recognized delta kinds are `output_text`, `refusal`, `function_call_arguments`,
